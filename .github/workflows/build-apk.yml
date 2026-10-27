@@ -161,12 +161,7 @@ jobs:
             npx capacitor-assets generate --android --iconBackgroundColor '#ffffff' --iconBackgroundColorDark '#ffffff'
 
             mkdir -p android/app/src/main/res/values
-            cat > android/app/src/main/res/values/ic_launcher_background.xml <<'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <color name="ic_launcher_background">#FFFFFF</color>
-</resources>
-EOF
+            printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#FFFFFF</color>\n</resources>\n' > android/app/src/main/res/values/ic_launcher_background.xml
           else
             echo "No $ICON.png found, keeping the default icon"
           fi
