@@ -47,99 +47,43 @@ jobs:
           cp -r "$(dirname "$idx")"/. www/
           ls www
 
-      - name: Inject File Picker & Bridge
+      - name: Inject simple save bridge
         run: |
-          cat > www/mizra-bridge.js <<'EOF'
+          cat > www/android-save.js <<'EOF'
           (function () {
-            // Save file picker polyfill for WordCraft & export buttons
-            window.showSaveFilePicker = async function (options) {
-              const suggestedName = (options && options.suggestedName) ? options.suggestedName : 'document';
-              return {
-                createWritable: async function () {
-                  let chunks = [];
-                  return {
-                    write: async function (data) { chunks.push(data); },
-                    close: async function () {
-                      const blob = new Blob(chunks);
-                      const reader = new FileReader();
-                      reader.onloadend = function () {
-                        const b64 = String(reader.result).split(',')[1] || '';
-                        if (window.AndroidSaver) {
-                          window.AndroidSaver.save(suggestedName, blob.type || 'application/octet-stream', b64);
-                        }
-                      };
-                      reader.readAsDataURL(blob);
-                    }
-                  };
-                }
-              };
-            };
-
-            function interceptDownload(a) {
-              const name = a.getAttribute('download') || 'export';
+            function save(a) {
+              var name = a.getAttribute('download') || 'export';
               fetch(a.href)
-                .then(r => r.blob())
-                .then(blob => {
-                  const reader = new FileReader();
-                  reader.onloadend = function () {
-                    const b64 = String(reader.result).split(',')[1] || '';
+                .then(function (r) { return r.blob(); })
+                .then(function (b) {
+                  var rd = new FileReader();
+                  rd.onloadend = function () {
+                    var data = String(rd.result).split(',')[1] || '';
                     if (window.AndroidSaver) {
-                      window.AndroidSaver.save(name, blob.type || 'application/octet-stream', b64);
+                      window.AndroidSaver.save(name, b.type || 'application/octet-stream', data);
                     }
                   };
-                  reader.readAsDataURL(blob);
+                  rd.readAsDataURL(b);
                 });
             }
-
-            const origClick = HTMLAnchorElement.prototype.click;
+            var origClick = HTMLAnchorElement.prototype.click;
             HTMLAnchorElement.prototype.click = function () {
               if (window.AndroidSaver && this.hasAttribute('download')) {
-                interceptDownload(this);
+                save(this);
                 return;
               }
               return origClick.apply(this, arguments);
             };
-
             document.addEventListener('click', function (e) {
-              const a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+              var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
               if (a && window.AndroidSaver) {
                 e.preventDefault();
-                interceptDownload(a);
+                save(a);
               }
             }, true);
-
-            // Forward incoming files to file inputs or drop handlers
-            window.addEventListener('androidFileOpened', function (e) {
-              if (!e.detail || !e.detail.data) return;
-              try {
-                const byteCharacters = atob(e.detail.data);
-                const byteNumbers = new Array(byteCharacters.length);
-                for (let i = 0; i < byteCharacters.length; i++) {
-                  byteNumbers[i] = byteCharacters.charCodeAt(i);
-                }
-                const byteArray = new Uint8Array(byteNumbers);
-                const blob = new Blob([byteArray], { type: e.detail.mime });
-                const file = new File([blob], e.detail.name || 'file', { type: e.detail.mime });
-
-                const dt = new DataTransfer();
-                dt.items.add(file);
-
-                const inputs = document.querySelectorAll('input[type="file"]');
-                if (inputs.length > 0) {
-                  inputs[0].files = dt.files;
-                  inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
-                }
-
-                const target = document.querySelector('canvas') || document.body;
-                target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
-              } catch (err) {
-                console.error("Failed to load file:", err);
-              }
-            });
           })();
           EOF
-
-          sed -i 's#</head>#<script src="mizra-bridge.js"></script></head>#' www/index.html
+          sed -i 's#</head>#<script src="android-save.js"></script></head>#' www/index.html
 
       - name: Create the Android project
         run: |
@@ -149,105 +93,30 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Inject Android Java Bridge
+      - name: Inject Clean MainActivity
         run: |
           dir="android/app/src/main/java/$(echo "$APP_ID" | tr . /)"
           mkdir -p "$dir"
           cat > "$dir/MainActivity.java" <<'EOF'
           package __PKG__;
 
-          import android.app.Activity;
-          import android.content.Intent;
-          import android.database.Cursor;
-          import android.net.Uri;
+          import android.content.ContentValues;
+          import android.os.Build;
           import android.os.Bundle;
-          import android.provider.OpenableColumns;
+          import android.os.Environment;
+          import android.provider.MediaStore;
           import android.util.Base64;
           import android.webkit.JavascriptInterface;
           import android.widget.Toast;
-          import androidx.activity.result.ActivityResultLauncher;
-          import androidx.activity.result.contract.ActivityResultContracts;
           import com.getcapacitor.BridgeActivity;
-          import java.io.ByteArrayOutputStream;
-          import java.io.InputStream;
           import java.io.OutputStream;
+          import android.net.Uri;
 
           public class MainActivity extends BridgeActivity {
-            private byte[] pendingSaveData = null;
-            private ActivityResultLauncher<Intent> saveFileLauncher;
-
             @Override
             public void onCreate(Bundle savedInstanceState) {
               super.onCreate(savedInstanceState);
-
-              saveFileLauncher = registerForActivityResult(
-                new ActivityResultContracts.StartActivityForResult(),
-                result -> {
-                  if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
-                    Uri uri = result.getData().getData();
-                    if (uri != null && pendingSaveData != null) {
-                      try (OutputStream out = getContentResolver().openOutputStream(uri)) {
-                        out.write(pendingSaveData);
-                        toast("File saved successfully");
-                      } catch (Exception e) {
-                        toast("Save error: " + e.getMessage());
-                      } finally {
-                        pendingSaveData = null;
-                      }
-                    }
-                  }
-                }
-              );
-
               getBridge().getWebView().addJavascriptInterface(new Saver(), "AndroidSaver");
-              handleIncomingIntent(getIntent());
-            }
-
-            @Override
-            protected void onNewIntent(Intent intent) {
-              super.onNewIntent(intent);
-              handleIncomingIntent(intent);
-            }
-
-            private void handleIncomingIntent(Intent intent) {
-              if (intent != null && Intent.ACTION_VIEW.equals(intent.getAction())) {
-                Uri uri = intent.getData();
-                if (uri != null) {
-                  try {
-                    String fileName = "opened_file";
-                    try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
-                      if (cursor != null && cursor.moveToFirst()) {
-                        int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
-                        if (idx >= 0) fileName = cursor.getString(idx);
-                      }
-                    } catch (Exception ignored) {}
-
-                    InputStream in = getContentResolver().openInputStream(uri);
-                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
-                    byte[] temp = new byte[4096];
-                    int read;
-                    while ((read = in.read(temp)) != -1) {
-                      buffer.write(temp, 0, read);
-                    }
-                    in.close();
-
-                    String b64 = Base64.encodeToString(buffer.toByteArray(), Base64.NO_WRAP);
-                    String mime = getContentResolver().getType(uri);
-                    if (mime == null) mime = "application/octet-stream";
-                    final String safeName = fileName;
-                    final String safeMime = mime;
-
-                    getBridge().getWebView().postDelayed(() -> {
-                      getBridge().getWebView().evaluateJavascript(
-                        "window.dispatchEvent(new CustomEvent('androidFileOpened', { detail: { data: '" + b64 + "', mime: '" + safeMime + "', name: '" + safeName + "' } }));",
-                        null
-                      );
-                    }, 1500);
-                  } catch (Exception e) {
-                    toast("Failed to open file: " + e.getMessage());
-                  }
-                }
-              }
             }
 
             private void toast(final String msg) {
@@ -258,95 +127,27 @@ jobs:
               @JavascriptInterface
               public void save(String name, String mime, String b64) {
                 try {
-                  pendingSaveData = Base64.decode(b64, Base64.DEFAULT);
-                  Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
-                  intent.addCategory(Intent.CATEGORY_OPENABLE);
-                  intent.setType(mime != null ? mime : "application/octet-stream");
-                  intent.putExtra(Intent.EXTRA_TITLE, name);
-                  saveFileLauncher.launch(intent);
+                  byte[] data = Base64.decode(b64, Base64.DEFAULT);
+                  String safe = name.replace("/", "_").replace("\\", "_");
+                  ContentValues v = new ContentValues();
+                  v.put(MediaStore.MediaColumns.DISPLAY_NAME, safe);
+                  v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                  v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                  Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                  if (uri != null) {
+                    OutputStream out = getContentResolver().openOutputStream(uri);
+                    out.write(data);
+                    out.close();
+                    toast("Saved to Downloads: " + safe);
+                  }
                 } catch (Exception e) {
-                  toast("Could not open save picker: " + e.getMessage());
+                  toast("Save failed: " + e.getMessage());
                 }
               }
             }
           }
           EOF
           sed -i "s/__PKG__/$APP_ID/" "$dir/MainActivity.java"
-
-      - name: Register App-Specific Default Intent Filters
-        run: |
-          python3 - <<'EOF'
-          import os
-
-          app_name = os.environ.get("APP_NAME", "").lower()
-          manifest_path = "android/app/src/main/AndroidManifest.xml"
-
-          with open(manifest_path, "r", encoding="utf-8") as f:
-              content = f.read()
-
-          # Ensure exported=true is present
-          if 'android:name=".MainActivity"' in content and 'android:exported="true"' not in content:
-              content = content.replace('android:name=".MainActivity"', 'android:name=".MainActivity" android:exported="true"')
-
-          # Valid, strictly standard Android intent filters
-          if "word" in app_name:
-              filters = """
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
-                      <data android:mimeType="application/msword" />
-                      <data android:mimeType="text/plain" />
-                      <data android:mimeType="application/rtf" />
-                  </intent-filter>"""
-          elif "vector" in app_name:
-              filters = """
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:mimeType="image/svg+xml" />
-                      <data android:mimeType="image/png" />
-                      <data android:mimeType="application/illustrator" />
-                  </intent-filter>"""
-          elif "pdf" in app_name:
-              filters = """
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:mimeType="application/pdf" />
-                  </intent-filter>"""
-          elif "photo" in app_name:
-              filters = """
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:mimeType="image/*" />
-                  </intent-filter>"""
-          else:
-              filters = """
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:mimeType="*/*" />
-                  </intent-filter>"""
-
-          target = "</activity>"
-          if target in content:
-              new_content = content.replace(target, f"{filters}\n        {target}", 1)
-              with open(manifest_path, "w", encoding="utf-8") as f:
-                  f.write(new_content)
-              print("Clean manifest intent filters successfully registered.")
-          EOF
 
       - name: Apply custom icon
         run: |
@@ -361,7 +162,7 @@ jobs:
             mkdir -p android/app/src/main/res/values
             printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#FFFFFF</color>\n</resources>\n' > android/app/src/main/res/values/ic_launcher_background.xml
           else
-            echo "No $ICON.png found, keeping the default icon"
+            echo "No $ICON.png found, keeping default icon"
           fi
 
       - name: Build the APK
