@@ -32,7 +32,8 @@ jobs:
       - name: Download the web build
         run: |
           mkdir -p dl unz www
-          gh release download --repo "$REPO" --pattern '*web*.zip' --dir dl
+          tag=$(gh release list --repo "$REPO" --limit 1 --json tagName --jq '.[0].tagName')
+gh release download "$tag" --repo "$REPO" --pattern '*web*.zip' --dir dl
           for z in dl/*.zip; do unzip -q "$z" -d unz; done
           idx=$(find unz -name index.html | head -n 1)
           cp -r "$(dirname "$idx")"/. www/
