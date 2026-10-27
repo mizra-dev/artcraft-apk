@@ -12,6 +12,9 @@ on:
       app_id:
         description: "App ID (lowercase, no spaces)"
         default: "com.example.vectorcraft"
+      icon:
+        description: "Icon file name without .png"
+        default: "vectorcraft"
 
 jobs:
   build:
@@ -20,8 +23,10 @@ jobs:
       REPO: ${{ inputs.repo }}
       APP_NAME: ${{ inputs.app_name }}
       APP_ID: ${{ inputs.app_id }}
+      ICON: ${{ inputs.icon }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -38,6 +43,42 @@ jobs:
           idx=$(find unz -name index.html | head -n 1)
           cp -r "$(dirname "$idx")"/. www/
           ls www
+      - name: Enable file saving (web part)
+        run: |
+          cat > www/android-save.js <<'EOF'
+          (function () {
+            function save(a) {
+              var name = a.getAttribute('download') || 'file';
+              fetch(a.href)
+                .then(function (r) { return r.blob(); })
+                .then(function (b) {
+                  var rd = new FileReader();
+                  rd.onloadend = function () {
+                    var data = String(rd.result).split(',')[1] || '';
+                    window.AndroidSaver.save(name, b.type || 'application/octet-stream', data);
+                  };
+                  rd.readAsDataURL(b);
+                });
+            }
+            var origClick = HTMLAnchorElement.prototype.click;
+            HTMLAnchorElement.prototype.click = function () {
+              if (window.AndroidSaver && this.hasAttribute('download')) {
+                save(this);
+                return;
+              }
+              return origClick.apply(this, arguments);
+            };
+            document.addEventListener('click', function (e) {
+              var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+              if (a && window.AndroidSaver) {
+                e.preventDefault();
+                save(a);
+              }
+            }, true);
+          })();
+          EOF
+          sed -i 's#</head>#<script src="android-save.js"></script></head>#' www/index.html
+          grep -c "android-save" www/index.html || echo "WARNING: could not add save script"
       - name: Create the Android project
         run: |
           npm init -y
@@ -45,6 +86,74 @@ jobs:
           npx cap init "$APP_NAME" "$APP_ID" --web-dir www
           npx cap add android
           npx cap sync android
+      - name: Enable file saving (Android part)
+        run: |
+          dir="android/app/src/main/java/$(echo "$APP_ID" | tr . /)"
+          mkdir -p "$dir"
+          cat > "$dir/MainActivity.java" <<'EOF'
+          package __PKG__;
+
+          import android.content.ContentValues;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.widget.Toast;
+          import com.getcapacitor.BridgeActivity;
+          import java.io.OutputStream;
+
+          public class MainActivity extends BridgeActivity {
+            @Override
+            public void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+              getBridge().getWebView().addJavascriptInterface(new Saver(), "AndroidSaver");
+            }
+
+            private void toast(final String msg) {
+              runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show());
+            }
+
+            public class Saver {
+              @JavascriptInterface
+              public void save(String name, String mime, String b64) {
+                try {
+                  if (Build.VERSION.SDK_INT < 29) {
+                    toast("Saving needs Android 10 or newer");
+                    return;
+                  }
+                  byte[] data = Base64.decode(b64, Base64.DEFAULT);
+                  String safe = name.replace("/", "_").replace("\\", "_");
+                  ContentValues v = new ContentValues();
+                  v.put(MediaStore.MediaColumns.DISPLAY_NAME, safe);
+                  v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
+                  v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                  Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
+                  OutputStream out = getContentResolver().openOutputStream(uri);
+                  out.write(data);
+                  out.close();
+                  toast("Saved to Downloads: " + safe);
+                } catch (Exception e) {
+                  toast("Save failed: " + e.getMessage());
+                }
+              }
+            }
+          }
+          EOF
+          sed -i "s/__PKG__/$APP_ID/" "$dir/MainActivity.java"
+      - name: Apply custom icon
+        run: |
+          if [ -f "$ICON.png" ]; then
+            mkdir -p assets
+            cp "$ICON.png" assets/icon-only.png
+            cp "$ICON.png" assets/icon-foreground.png
+            npm i -D @capacitor/assets
+            npx capacitor-assets generate --android --iconBackgroundColor '#ffffff' --iconBackgroundColorDark '#ffffff'
+          else
+            echo "No $ICON.png found, keeping the default icon"
+          fi
       - name: Build the APK
         run: |
           cd android
