@@ -47,27 +47,20 @@ jobs:
           cp -r "$(dirname "$idx")"/. www/
           ls www
 
-      - name: Inject Polyfills and File Bridge
+      - name: Inject File Picker & Bridge
         run: |
           cat > www/mizra-bridge.js <<'EOF'
           (function () {
-            // Memory storage for recent file blobs so internal engine can re-read them
-            const fileCache = new Map();
-
-            // Intercept save operations (WordCraft & VectorCraft)
+            // Save file picker polyfill for WordCraft & export buttons
             window.showSaveFilePicker = async function (options) {
               const suggestedName = (options && options.suggestedName) ? options.suggestedName : 'document';
               return {
-                kind: 'file',
-                name: suggestedName,
-                getFile: async () => new File([], suggestedName),
                 createWritable: async function () {
                   let chunks = [];
                   return {
                     write: async function (data) { chunks.push(data); },
                     close: async function () {
                       const blob = new Blob(chunks);
-                      fileCache.set(suggestedName, blob);
                       const reader = new FileReader();
                       reader.onloadend = function () {
                         const b64 = String(reader.result).split(',')[1] || '';
@@ -82,13 +75,11 @@ jobs:
               };
             };
 
-            // Intercept anchor tag downloads (SVG/PNG exports)
             function interceptDownload(a) {
               const name = a.getAttribute('download') || 'export';
               fetch(a.href)
                 .then(r => r.blob())
                 .then(blob => {
-                  fileCache.set(name, blob);
                   const reader = new FileReader();
                   reader.onloadend = function () {
                     const b64 = String(reader.result).split(',')[1] || '';
@@ -117,7 +108,7 @@ jobs:
               }
             }, true);
 
-            // Incoming file handler when launched via "Open with" or Default app
+            // Forward incoming files to file inputs or drop handlers
             window.addEventListener('androidFileOpened', function (e) {
               if (!e.detail || !e.detail.data) return;
               try {
@@ -129,25 +120,20 @@ jobs:
                 const byteArray = new Uint8Array(byteNumbers);
                 const blob = new Blob([byteArray], { type: e.detail.mime });
                 const file = new File([blob], e.detail.name || 'file', { type: e.detail.mime });
-                
-                fileCache.set(file.name, file);
 
-                // Dispatch synthetic file input change
+                const dt = new DataTransfer();
+                dt.items.add(file);
+
                 const inputs = document.querySelectorAll('input[type="file"]');
                 if (inputs.length > 0) {
-                  const dt = new DataTransfer();
-                  dt.items.add(file);
                   inputs[0].files = dt.files;
                   inputs[0].dispatchEvent(new Event('change', { bubbles: true }));
                 }
 
-                // Dispatch drop on canvas
                 const target = document.querySelector('canvas') || document.body;
-                const dtDrop = new DataTransfer();
-                dtDrop.items.add(file);
-                target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dtDrop }));
+                target.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
               } catch (err) {
-                console.error("Failed to load file into app:", err);
+                console.error("Failed to load file:", err);
               }
             });
           })();
@@ -224,7 +210,7 @@ jobs:
             }
 
             private void handleIncomingIntent(Intent intent) {
-              if (intent != null && (Intent.ACTION_VIEW.equals(intent.getAction()) || Intent.ACTION_EDIT.equals(intent.getAction()))) {
+              if (intent != null && Intent.ACTION_VIEW.equals(intent.getAction())) {
                 Uri uri = intent.getData();
                 if (uri != null) {
                   try {
@@ -298,61 +284,33 @@ jobs:
           with open(manifest_path, "r", encoding="utf-8") as f:
               content = f.read()
 
-          # Set exported=true
+          # Ensure exported=true is present
           if 'android:name=".MainActivity"' in content and 'android:exported="true"' not in content:
               content = content.replace('android:name=".MainActivity"', 'android:name=".MainActivity" android:exported="true"')
 
-          # App-specific intent filters with exact mimeTypes and pathPatterns
+          # Valid, strictly standard Android intent filters
           if "word" in app_name:
               filters = """
                   <intent-filter>
                       <action android:name="android.intent.action.VIEW" />
-                      <action android:name="android.intent.action.EDIT" />
                       <category android:name="android.intent.category.DEFAULT" />
                       <category android:name="android.intent.category.BROWSABLE" />
                       <data android:scheme="content" />
-                      <data android:scheme="file" />
                       <data android:mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
                       <data android:mimeType="application/msword" />
                       <data android:mimeType="text/plain" />
                       <data android:mimeType="application/rtf" />
-                  </intent-filter>
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <action android:name="android.intent.action.EDIT" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:scheme="file" />
-                      <data android:host="*" />
-                      <data android:pathPattern=".*\\.docx" />
-                      <data android:pathPattern=".*\\.doc" />
-                      <data android:pathPattern=".*\\.txt" />
                   </intent-filter>"""
           elif "vector" in app_name:
               filters = """
                   <intent-filter>
                       <action android:name="android.intent.action.VIEW" />
-                      <action android:name="android.intent.action.EDIT" />
                       <category android:name="android.intent.category.DEFAULT" />
                       <category android:name="android.intent.category.BROWSABLE" />
                       <data android:scheme="content" />
-                      <data android:scheme="file" />
                       <data android:mimeType="image/svg+xml" />
+                      <data android:mimeType="image/png" />
                       <data android:mimeType="application/illustrator" />
-                      <data android:mimeType="application/postscript" />
-                  </intent-filter>
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <action android:name="android.intent.action.EDIT" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:scheme="file" />
-                      <data android:host="*" />
-                      <data android:pathPattern=".*\\.svg" />
-                      <data android:pathPattern=".*\\.ai" />
-                      <data android:pathPattern=".*\\.vectorcraft" />
                   </intent-filter>"""
           elif "pdf" in app_name:
               filters = """
@@ -361,40 +319,16 @@ jobs:
                       <category android:name="android.intent.category.DEFAULT" />
                       <category android:name="android.intent.category.BROWSABLE" />
                       <data android:scheme="content" />
-                      <data android:scheme="file" />
                       <data android:mimeType="application/pdf" />
-                  </intent-filter>
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:scheme="file" />
-                      <data android:host="*" />
-                      <data android:pathPattern=".*\\.pdf" />
                   </intent-filter>"""
           elif "photo" in app_name:
               filters = """
                   <intent-filter>
                       <action android:name="android.intent.action.VIEW" />
-                      <action android:name="android.intent.action.EDIT" />
                       <category android:name="android.intent.category.DEFAULT" />
                       <category android:name="android.intent.category.BROWSABLE" />
                       <data android:scheme="content" />
-                      <data android:scheme="file" />
                       <data android:mimeType="image/*" />
-                  </intent-filter>
-                  <intent-filter>
-                      <action android:name="android.intent.action.VIEW" />
-                      <action android:name="android.intent.action.EDIT" />
-                      <category android:name="android.intent.category.DEFAULT" />
-                      <category android:name="android.intent.category.BROWSABLE" />
-                      <data android:scheme="content" />
-                      <data android:scheme="file" />
-                      <data android:host="*" />
-                      <data android:pathPattern=".*\\.psd" />
-                      <data android:pathPattern=".*\\.png" />
-                      <data android:pathPattern=".*\\.jpg" />
                   </intent-filter>"""
           else:
               filters = """
@@ -403,7 +337,6 @@ jobs:
                       <category android:name="android.intent.category.DEFAULT" />
                       <category android:name="android.intent.category.BROWSABLE" />
                       <data android:scheme="content" />
-                      <data android:scheme="file" />
                       <data android:mimeType="*/*" />
                   </intent-filter>"""
 
@@ -412,7 +345,7 @@ jobs:
               new_content = content.replace(target, f"{filters}\n        {target}", 1)
               with open(manifest_path, "w", encoding="utf-8") as f:
                   f.write(new_content)
-              print("Injected manifest filters.")
+              print("Clean manifest intent filters successfully registered.")
           EOF
 
       - name: Apply custom icon
