@@ -11,7 +11,7 @@ on:
         default: "VectorCraft"
       app_id:
         description: "App ID (lowercase, no spaces)"
-        default: "com.example.vectorcraft"
+        default: "com.mizra.vectorcraft"
       icon:
         description: "Icon file name without .png"
         default: "vectorcraft"
@@ -47,42 +47,223 @@ jobs:
           cp -r "$(dirname "$idx")"/. www/
           ls www
 
-      - name: Enable file saving (web part)
+      - name: Enable file saving and recent files UI (web part)
         run: |
-          cat > www/android-save.js <<'EOF'
+          cat > www/android-bridge.js <<'EOF'
           (function () {
-            function save(a) {
-              var name = a.getAttribute('download') || 'file';
+            const STORAGE_KEY = 'mizra_recent_files';
+
+            function getRecentFiles() {
+              try {
+                return JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+              } catch (e) {
+                return [];
+              }
+            }
+
+            function saveRecentFile(name, mime, dataUrl) {
+              let recents = getRecentFiles();
+              recents = recents.filter(f => f.name !== name);
+              recents.unshift({
+                name: name,
+                mime: mime,
+                dataUrl: dataUrl,
+                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' })
+              });
+              if (recents.length > 10) recents = recents.slice(0, 10);
+              localStorage.setItem(STORAGE_KEY, JSON.stringify(recents));
+              renderRecentFiles();
+            }
+
+            function loadFileIntoApp(name, mime, dataUrl) {
+              fetch(dataUrl)
+                .then(r => r.blob())
+                .then(blob => {
+                  const file = new File([blob], name, { type: mime });
+                  const dt = new DataTransfer();
+                  dt.items.add(file);
+                  
+                  const fileInputs = document.querySelectorAll('input[type="file"]');
+                  if (fileInputs.length > 0) {
+                    fileInputs[0].files = dt.files;
+                    fileInputs[0].dispatchEvent(new Event('change', { bubbles: true }));
+                  } else {
+                    window.dispatchEvent(new CustomEvent('androidFileOpened', { detail: { data: dataUrl.split(',')[1] || '', mime: mime, name: name } }));
+                  }
+                  closeDrawer();
+                });
+            }
+
+            function interceptSave(a) {
+              const name = a.getAttribute('download') || 'file';
               fetch(a.href)
-                .then(function (r) { return r.blob(); })
-                .then(function (b) {
-                  var rd = new FileReader();
+                .then(r => r.blob())
+                .then(b => {
+                  const rd = new FileReader();
                   rd.onloadend = function () {
-                    var data = String(rd.result).split(',')[1] || '';
-                    window.AndroidSaver.save(name, b.type || 'application/octet-stream', data);
+                    const dataUrl = String(rd.result);
+                    const b64 = dataUrl.split(',')[1] || '';
+                    const mime = b.type || 'application/octet-stream';
+                    saveRecentFile(name, mime, dataUrl);
+                    if (window.AndroidSaver) {
+                      window.AndroidSaver.save(name, mime, b64);
+                    }
                   };
                   rd.readAsDataURL(b);
                 });
             }
-            var origClick = HTMLAnchorElement.prototype.click;
+
+            const origClick = HTMLAnchorElement.prototype.click;
             HTMLAnchorElement.prototype.click = function () {
               if (window.AndroidSaver && this.hasAttribute('download')) {
-                save(this);
+                interceptSave(this);
                 return;
               }
               return origClick.apply(this, arguments);
             };
+
             document.addEventListener('click', function (e) {
-              var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+              const a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
               if (a && window.AndroidSaver) {
                 e.preventDefault();
-                save(a);
+                interceptSave(a);
               }
             }, true);
+
+            window.addEventListener('androidFileOpened', function (e) {
+              if (e.detail && e.detail.data) {
+                const dataUrl = 'data:' + (e.detail.mime || 'application/octet-stream') + ';base64,' + e.detail.data;
+                const name = e.detail.name || 'imported_file';
+                saveRecentFile(name, e.detail.mime, dataUrl);
+              }
+            });
+
+            function createUI() {
+              const style = document.createElement('style');
+              style.innerHTML = `
+                #mizra-recents-btn {
+                  position: fixed;
+                  bottom: 16px;
+                  left: 16px;
+                  width: 44px;
+                  height: 44px;
+                  background: #1e293b;
+                  color: #fff;
+                  border-radius: 50%;
+                  box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+                  display: flex;
+                  align-items: center;
+                  justify-content: center;
+                  z-index: 999999;
+                  cursor: pointer;
+                  border: 1px solid rgba(255,255,255,0.2);
+                  font-size: 20px;
+                }
+                #mizra-drawer-backdrop {
+                  display: none;
+                  position: fixed;
+                  inset: 0;
+                  background: rgba(0,0,0,0.5);
+                  z-index: 9999998;
+                }
+                #mizra-drawer {
+                  position: fixed;
+                  left: 0;
+                  bottom: 0;
+                  width: 100%;
+                  max-height: 60vh;
+                  background: #ffffff;
+                  color: #1e293b;
+                  border-radius: 16px 16px 0 0;
+                  padding: 16px;
+                  box-sizing: border-box;
+                  z-index: 9999999;
+                  display: none;
+                  overflow-y: auto;
+                  box-shadow: 0 -4px 16px rgba(0,0,0,0.2);
+                  font-family: sans-serif;
+                }
+                .mizra-recent-item {
+                  display: flex;
+                  justify-content: space-between;
+                  align-items: center;
+                  padding: 12px 8px;
+                  border-bottom: 1px solid #e2e8f0;
+                  cursor: pointer;
+                }
+                .mizra-recent-item:last-child { border-bottom: none; }
+                .mizra-recent-title { font-size: 14px; font-weight: 600; color: #0f172a; word-break: break-all; }
+                .mizra-recent-time { font-size: 12px; color: #64748b; margin-top: 2px; }
+              `;
+              document.head.appendChild(style);
+
+              const btn = document.createElement('div');
+              btn.id = 'mizra-recents-btn';
+              btn.innerHTML = '🕒';
+              btn.title = 'Recent Files';
+              btn.onclick = openDrawer;
+
+              const backdrop = document.createElement('div');
+              backdrop.id = 'mizra-drawer-backdrop';
+              backdrop.onclick = closeDrawer;
+
+              const drawer = document.createElement('div');
+              drawer.id = 'mizra-drawer';
+              drawer.innerHTML = `
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 12px;">
+                  <strong style="font-size: 16px;">Recent Files</strong>
+                  <button id="mizra-close-btn" style="background:none;border:none;font-size:18px;cursor:pointer;">✕</button>
+                </div>
+                <div id="mizra-recent-list"></div>
+              `;
+
+              document.body.appendChild(btn);
+              document.body.appendChild(backdrop);
+              document.body.appendChild(drawer);
+              document.getElementById('mizra-close-btn').onclick = closeDrawer;
+            }
+
+            function openDrawer() {
+              renderRecentFiles();
+              document.getElementById('mizra-drawer-backdrop').style.display = 'block';
+              document.getElementById('mizra-drawer').style.display = 'block';
+            }
+
+            function closeDrawer() {
+              document.getElementById('mizra-drawer-backdrop').style.display = 'none';
+              document.getElementById('mizra-drawer').style.display = 'none';
+            }
+
+            function renderRecentFiles() {
+              const container = document.getElementById('mizra-recent-list');
+              if (!container) return;
+              const recents = getRecentFiles();
+              if (recents.length === 0) {
+                container.innerHTML = '<p style="color:#94a3b8; font-size:13px; text-align:center; padding: 20px 0;">No recent files yet</p>';
+                return;
+              }
+              container.innerHTML = '';
+              recents.forEach(item => {
+                const row = document.createElement('div');
+                row.className = 'mizra-recent-item';
+                row.innerHTML = `
+                  <div>
+                    <div class="mizra-recent-title">${item.name}</div>
+                    <div class="mizra-recent-time">${item.timestamp}</div>
+                  </div>
+                  <span style="font-size:18px; color:#3b82f6;">➔</span>
+                `;
+                row.onclick = () => loadFileIntoApp(item.name, item.mime, item.dataUrl);
+                container.appendChild(row);
+              });
+            }
+
+            window.addEventListener('DOMContentLoaded', createUI);
           })();
           EOF
-          sed -i 's#</head>#<script src="android-save.js"></script></head>#' www/index.html
-          grep -c "android-save" www/index.html || echo "WARNING: could not add save script"
+
+          sed -i 's#</head>#<script src="android-bridge.js"></script></head>#' www/index.html
+          grep -c "android-bridge" www/index.html || echo "WARNING: could not add bridge script"
 
       - name: Create the Android project
         run: |
@@ -92,63 +273,145 @@ jobs:
           npx cap add android
           npx cap sync android
 
-      - name: Enable file saving (Android part)
+      - name: Enable file saving and opening (Android part)
         run: |
           dir="android/app/src/main/java/$(echo "$APP_ID" | tr . /)"
           mkdir -p "$dir"
           cat > "$dir/MainActivity.java" <<'EOF'
           package __PKG__;
 
+          import android.app.Activity;
           import android.content.ContentValues;
+          import android.content.Intent;
+          import android.database.Cursor;
           import android.net.Uri;
           import android.os.Build;
           import android.os.Bundle;
           import android.os.Environment;
-          import android.provider.MediaStore;
+          import android.provider.OpenableColumns;
           import android.util.Base64;
           import android.webkit.JavascriptInterface;
           import android.widget.Toast;
+          import androidx.activity.result.ActivityResultLauncher;
+          import androidx.activity.result.contract.ActivityResultContracts;
           import com.getcapacitor.BridgeActivity;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
           import java.io.OutputStream;
 
           public class MainActivity extends BridgeActivity {
+            private byte[] pendingSaveData = null;
+            private ActivityResultLauncher<Intent> saveFileLauncher;
+
             @Override
             public void onCreate(Bundle savedInstanceState) {
               super.onCreate(savedInstanceState);
+
+              saveFileLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                  if (result.getResultCode() == Activity.RESULT_OK && result.getData() != null) {
+                    Uri uri = result.getData().getData();
+                    if (uri != null && pendingSaveData != null) {
+                      try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                        out.write(pendingSaveData);
+                        toast("File saved successfully");
+                      } catch (Exception e) {
+                        toast("Failed to save: " + e.getMessage());
+                      } finally {
+                        pendingSaveData = null;
+                      }
+                    }
+                  }
+                }
+              );
+
               getBridge().getWebView().addJavascriptInterface(new Saver(), "AndroidSaver");
+              handleIncomingIntent(getIntent());
+            }
+
+            @Override
+            protected void onNewIntent(Intent intent) {
+              super.onNewIntent(intent);
+              handleIncomingIntent(intent);
+            }
+
+            private void handleIncomingIntent(Intent intent) {
+              if (intent != null && Intent.ACTION_VIEW.equals(intent.getAction())) {
+                Uri uri = intent.getData();
+                if (uri != null) {
+                  try {
+                    String fileName = "imported_file";
+                    try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
+                      if (cursor != null && cursor.moveToFirst()) {
+                        int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                        if (idx >= 0) fileName = cursor.getString(idx);
+                      }
+                    } catch (Exception ignored) {}
+
+                    InputStream in = getContentResolver().openInputStream(uri);
+                    ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+                    byte[] temp = new byte[4096];
+                    int read;
+                    while ((read = in.read(temp)) != -1) {
+                      buffer.write(temp, 0, read);
+                    }
+                    in.close();
+
+                    String b64 = Base64.encodeToString(buffer.toByteArray(), Base64.NO_WRAP);
+                    String mime = getContentResolver().getType(uri);
+                    final String safeName = fileName;
+
+                    getBridge().getWebView().post(() -> {
+                      getBridge().getWebView().evaluateJavascript(
+                        "window.dispatchEvent(new CustomEvent('androidFileOpened', { detail: { data: '" + b64 + "', mime: '" + mime + "', name: '" + safeName + "' } }));",
+                        null
+                      );
+                    });
+                  } catch (Exception e) {
+                    toast("Failed to read file: " + e.getMessage());
+                  }
+                }
+              }
             }
 
             private void toast(final String msg) {
-              runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show());
+              runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show());
             }
 
             public class Saver {
               @JavascriptInterface
               public void save(String name, String mime, String b64) {
                 try {
-                  if (Build.VERSION.SDK_INT < 29) {
-                    toast("Saving needs Android 10 or newer");
-                    return;
-                  }
-                  byte[] data = Base64.decode(b64, Base64.DEFAULT);
-                  String safe = name.replace("/", "_").replace("\\", "_");
-                  ContentValues v = new ContentValues();
-                  v.put(MediaStore.MediaColumns.DISPLAY_NAME, safe);
-                  v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-                  v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-                  Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
-                  OutputStream out = getContentResolver().openOutputStream(uri);
-                  out.write(data);
-                  out.close();
-                  toast("Saved to Downloads: " + safe);
+                  pendingSaveData = Base64.decode(b64, Base64.DEFAULT);
+
+                  Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                  intent.addCategory(Intent.CATEGORY_OPENABLE);
+                  intent.setType(mime != null ? mime : "application/octet-stream");
+                  intent.putExtra(Intent.EXTRA_TITLE, name);
+                  saveFileLauncher.launch(intent);
                 } catch (Exception e) {
-                  toast("Save failed: " + e.getMessage());
+                  toast("Save dialog error: " + e.getMessage());
                 }
               }
             }
           }
           EOF
           sed -i "s/__PKG__/$APP_ID/" "$dir/MainActivity.java"
+
+      - name: Register Intent Filters (Open Files as Default)
+        run: |
+          manifest="android/app/src/main/AndroidManifest.xml"
+
+          sed -i '/<\/activity>/i \
+            <intent-filter>\
+                <action android:name="android.intent.action.VIEW" />\
+                <category android:name="android.intent.category.DEFAULT" />\
+                <category android:name="android.intent.category.BROWSABLE" />\
+                <data android:scheme="content" />\
+                <data android:scheme="file" />\
+                <data android:mimeType="*/*" />\
+            </intent-filter>' "$manifest"
 
       - name: Apply custom icon
         run: |
