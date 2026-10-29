@@ -3,24 +3,15 @@ name: Build APK
 on:
   workflow_dispatch:
     inputs:
-      repo:
-        description: "ArtCraft app repo"
-        default: "storytold/vectorcraft"
-      app_name:
-        description: "App name"
-        default: "VectorCraft"
-      app_id:
-        description: "App ID (lowercase, no spaces)"
-        default: "com.mizra.vectorcraft"
-      icon:
-        description: "Icon file name without .png"
-        default: "vectorcraft"
-      mime_types:
-        description: "File MIME types to open (comma separated)"
-        default: "image/svg+xml"
-      extensions:
-        description: "File extensions to open (comma separated, no dots)"
-        default: "svg,vectorcraft"
+      app:
+        description: "Which app to build"
+        type: choice
+        default: vectorcraft
+        options:
+          - vectorcraft
+          - wordcraft
+          - pdfcraft
+          - photocraft
       autosave_seconds:
         description: "Auto-save every N seconds (0 = off)"
         default: "30"
@@ -29,16 +20,48 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      REPO: ${{ inputs.repo }}
-      APP_NAME: ${{ inputs.app_name }}
-      APP_ID: ${{ inputs.app_id }}
-      ICON: ${{ inputs.icon }}
-      MIMES: ${{ inputs.mime_types }}
-      EXTS: ${{ inputs.extensions }}
+      APP: ${{ inputs.app }}
       AUTOSAVE: ${{ inputs.autosave_seconds }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Choose app settings
+        run: |
+          case "$APP" in
+            vectorcraft)
+              name="VectorCraft"
+              mimes="image/svg+xml,application/illustrator,application/postscript,application/eps,application/pdf,image/x-eps"
+              exts="svg,svgz,vectorcraft,ai,eps,dxf,emf,wmf,af,afdesign,afpub,pdf,afphoto"
+              ;;
+            wordcraft)
+              name="WordCraft"
+              mimes="application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword,application/vnd.oasis.opendocument.text,application/rtf,text/rtf,text/html,text/markdown,text/x-markdown,text/plain,application/x-tex,text/x-tex"
+              exts="docx,doc,odt,rtf,html,md,tex,txt"
+              ;;
+            pdfcraft)
+              name="PdfCraft"
+              mimes="application/pdf"
+              exts="pdf"
+              ;;
+            photocraft)
+              name="PhotoCraft"
+              mimes="image/vnd.adobe.photoshop,image/x-photoshop,application/x-photoshop,application/photoshop,image/png,image/jpeg,image/tiff,image/webp,image/gif,image/bmp,image/x-tga,image/x-icon,image/vnd.microsoft.icon,image/avif,image/x-exr"
+              exts="psd,psb,pcraft,png,jpg,jpeg,tif,tiff,webp,gif,bmp,tga,ico,qoi,pnm,ppm,pgm,pbm,exr,hdr,avif"
+              ;;
+            *)
+              echo "Unknown app: $APP"
+              exit 1
+              ;;
+          esac
+          {
+            echo "REPO=storytold/$APP"
+            echo "APP_NAME=$name"
+            echo "APP_ID=com.mizra.$APP"
+            echo "ICON=$APP"
+            echo "MIMES=$mimes"
+            echo "EXTS=$exts"
+          } >> "$GITHUB_ENV"
 
       - uses: actions/setup-node@v4
         with:
@@ -597,5 +620,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ inputs.app_name }}-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: ${{ inputs.app }}-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apkh
