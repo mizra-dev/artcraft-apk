@@ -21,6 +21,9 @@ on:
       extensions:
         description: "File extensions to open (comma separated, no dots)"
         default: "svg,vectorcraft"
+      autosave_seconds:
+        description: "Auto-save every N seconds (0 = off)"
+        default: "30"
 
 jobs:
   build:
@@ -32,6 +35,7 @@ jobs:
       ICON: ${{ inputs.icon }}
       MIMES: ${{ inputs.mime_types }}
       EXTS: ${{ inputs.extensions }}
+      AUTOSAVE: ${{ inputs.autosave_seconds }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -68,7 +72,7 @@ jobs:
                   rd.onloadend = function () {
                     var data = String(rd.result).split(',')[1] || '';
                     if (window.AndroidSaver) {
-                      window.AndroidSaver.save(name, b.type || 'application/octet-stream', data);
+                      window.AndroidSaver.save(name, b.type || 'application/octet-stream', data, !!window.__autosaving);
                     }
                   };
                   rd.readAsDataURL(b);
@@ -133,6 +137,24 @@ jobs:
             window.addEventListener('load', waitForApp);
           })();
           EOF
+          cat >> www/android-save.js <<'EOF'
+          (function () {
+            var sec = __AUTOSAVE__;
+            if (!sec) return;
+            setInterval(function () {
+              if (!window.AndroidSaver || !window.AndroidSaver.autoSaveReady()) return;
+              window.__autosaving = true;
+              var t = document.querySelector('canvas') || document.body;
+              ['keydown', 'keyup'].forEach(function (type) {
+                t.dispatchEvent(new KeyboardEvent(type, {
+                  key: 's', code: 'KeyS', keyCode: 83, ctrlKey: true, bubbles: true, cancelable: true
+                }));
+              });
+              setTimeout(function () { window.__autosaving = false; }, 3000);
+            }, sec * 1000);
+          })();
+          EOF
+          sed -i "s/__AUTOSAVE__/${AUTOSAVE:-30}/" www/android-save.js
           sed -i 's#</head>#<script src="android-save.js"></script></head>#' www/index.html
 
       - name: Create the Android project
@@ -150,54 +172,118 @@ jobs:
           cat > "$dir/MainActivity.java" <<'EOF'
           package __PKG__;
 
-          import android.content.ContentValues;
+          import android.app.AlertDialog;
           import android.content.Intent;
+          import android.content.SharedPreferences;
           import android.database.Cursor;
+          import android.graphics.drawable.GradientDrawable;
           import android.net.Uri;
           import android.os.Bundle;
-          import android.os.Environment;
-          import android.provider.MediaStore;
           import android.provider.OpenableColumns;
           import android.util.Base64;
+          import android.view.Gravity;
+          import android.view.MotionEvent;
+          import android.view.View;
           import android.webkit.JavascriptInterface;
+          import android.widget.Button;
+          import android.widget.FrameLayout;
           import android.widget.Toast;
           import com.getcapacitor.BridgeActivity;
           import java.io.ByteArrayOutputStream;
           import java.io.InputStream;
           import java.io.OutputStream;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
 
           public class MainActivity extends BridgeActivity {
+            private static final int REQ_CREATE = 7101;
+            private static final int REQ_OPEN = 7102;
+            private static final int RW =
+              Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION;
+
             private String pName = "";
             private String pMime = "";
             private String pData = "";
+            private Uri linkedUri = null;
+            private String linkedWebName = null;
+            private boolean userSavedOnce = false;
+            private boolean forcePicker = false;
+            private boolean autoSave = true;
+            private String lastHash = "";
+            private String saveName = "";
+            private String saveMime = "";
+            private byte[] saveBytes = null;
+            private SharedPreferences prefs;
 
             @Override
             public void onCreate(Bundle savedInstanceState) {
               super.onCreate(savedInstanceState);
+              prefs = getSharedPreferences("files", MODE_PRIVATE);
+              autoSave = prefs.getBoolean("autosave", true);
               getBridge().getWebView().addJavascriptInterface(new Saver(), "AndroidSaver");
-              readIncoming(getIntent());
+              addFilesButton();
+              Intent in = getIntent();
+              if (in != null && Intent.ACTION_VIEW.equals(in.getAction()) && in.getData() != null) {
+                loadUri(in.getData());
+              }
             }
 
             @Override
-            protected void onNewIntent(Intent intent) {
+            public void onNewIntent(Intent intent) {
               super.onNewIntent(intent);
               setIntent(intent);
-              readIncoming(intent);
-              getBridge().getWebView().post(() ->
-                getBridge().getWebView().evaluateJavascript(
-                  "window.__openPending && window.__openPending()", null));
+              if (intent != null && Intent.ACTION_VIEW.equals(intent.getAction()) && intent.getData() != null) {
+                if (loadUri(intent.getData())) triggerOpen();
+              }
+            }
+
+            @Override
+            public void onActivityResult(int req, int res, Intent data) {
+              super.onActivityResult(req, res, data);
+              if (res != RESULT_OK || data == null || data.getData() == null) return;
+              Uri uri = data.getData();
+              if (req == REQ_CREATE && saveBytes != null) {
+                try {
+                  writeTo(uri, saveBytes);
+                  persist(uri);
+                  linkedUri = uri;
+                  linkedWebName = saveName;
+                  userSavedOnce = true;
+                  lastHash = hash(saveBytes);
+                  String shown = queryName(uri);
+                  remember(shown, uri);
+                  toast("Saved: " + shown);
+                } catch (Exception e) {
+                  toast("Save failed: " + e.getMessage());
+                }
+              } else if (req == REQ_OPEN) {
+                if (loadUri(uri)) triggerOpen();
+              }
             }
 
             private void toast(final String msg) {
               runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show());
             }
 
-            private void readIncoming(Intent intent) {
+            private int dp(int v) {
+              return (int) (v * getResources().getDisplayMetrics().density);
+            }
+
+            private void triggerOpen() {
+              getBridge().getWebView().post(() ->
+                getBridge().getWebView().evaluateJavascript(
+                  "window.__openPending && window.__openPending()", null));
+            }
+
+            private String hash(byte[] b) {
+              return b.length + ":" + Arrays.hashCode(b);
+            }
+
+            private String queryName(Uri uri) {
+              String name = null;
               try {
-                if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return;
-                Uri uri = intent.getData();
-                if (uri == null) return;
-                String name = null;
                 Cursor c = getContentResolver().query(uri, null, null, null, null);
                 if (c != null) {
                   try {
@@ -207,8 +293,42 @@ jobs:
                     c.close();
                   }
                 }
-                if (name == null) name = uri.getLastPathSegment();
-                if (name == null) name = "file";
+              } catch (Exception e) {
+              }
+              if (name == null) name = uri.getLastPathSegment();
+              if (name == null) name = "file";
+              return name;
+            }
+
+            private boolean persist(Uri uri) {
+              try {
+                getContentResolver().takePersistableUriPermission(uri, RW);
+                return true;
+              } catch (Exception e) {
+              }
+              try {
+                getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                return true;
+              } catch (Exception e) {
+              }
+              return false;
+            }
+
+            private void writeTo(Uri uri, byte[] data) throws Exception {
+              OutputStream out;
+              try {
+                out = getContentResolver().openOutputStream(uri, "wt");
+              } catch (Exception e) {
+                out = getContentResolver().openOutputStream(uri, "w");
+              }
+              if (out == null) throw new Exception("cannot open file for writing");
+              out.write(data);
+              out.close();
+            }
+
+            private boolean loadUri(Uri uri) {
+              try {
+                String name = queryName(uri);
                 String mime = getContentResolver().getType(uri);
                 InputStream in = getContentResolver().openInputStream(uri);
                 ByteArrayOutputStream buf = new ByteArrayOutputStream();
@@ -219,9 +339,172 @@ jobs:
                 pData = Base64.encodeToString(buf.toByteArray(), Base64.NO_WRAP);
                 pMime = (mime == null) ? "application/octet-stream" : mime;
                 pName = name;
+                linkedUri = uri;
+                linkedWebName = name;
+                userSavedOnce = false;
+                lastHash = "";
+                if (persist(uri)) remember(name, uri);
+                return true;
               } catch (Exception e) {
                 toast("Could not open file: " + e.getMessage());
+                return false;
               }
+            }
+
+            private void doSave(String name, String mime, byte[] data, boolean auto) {
+              String h = hash(data);
+              if (!forcePicker && linkedUri != null && name.equals(linkedWebName)) {
+                if (auto && h.equals(lastHash)) return;
+                try {
+                  writeTo(linkedUri, data);
+                  lastHash = h;
+                  if (!auto) {
+                    userSavedOnce = true;
+                    toast("Saved: " + queryName(linkedUri));
+                  }
+                  return;
+                } catch (Exception e) {
+                  linkedUri = null;
+                  if (auto) return;
+                  toast("Cannot write to the original file. Choose where to save.");
+                }
+              }
+              if (auto) return;
+              forcePicker = false;
+              saveName = name;
+              saveMime = mime;
+              saveBytes = data;
+              Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+              i.addCategory(Intent.CATEGORY_OPENABLE);
+              i.setType(mime);
+              i.putExtra(Intent.EXTRA_TITLE, name);
+              i.addFlags(RW | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+              startActivityForResult(i, REQ_CREATE);
+            }
+
+            private void remember(String name, Uri uri) {
+              try {
+                JSONArray old = new JSONArray(prefs.getString("recents", "[]"));
+                JSONArray out = new JSONArray();
+                JSONObject entry = new JSONObject();
+                entry.put("name", name);
+                entry.put("uri", uri.toString());
+                out.put(entry);
+                for (int i = 0; i < old.length() && out.length() < 15; i++) {
+                  JSONObject o = old.getJSONObject(i);
+                  if (!o.getString("uri").equals(uri.toString())) out.put(o);
+                }
+                prefs.edit().putString("recents", out.toString()).apply();
+              } catch (Exception e) {
+              }
+            }
+
+            private void removeRecent(String uriStr) {
+              try {
+                JSONArray old = new JSONArray(prefs.getString("recents", "[]"));
+                JSONArray out = new JSONArray();
+                for (int i = 0; i < old.length(); i++) {
+                  JSONObject o = old.getJSONObject(i);
+                  if (!o.getString("uri").equals(uriStr)) out.put(o);
+                }
+                prefs.edit().putString("recents", out.toString()).apply();
+              } catch (Exception e) {
+              }
+            }
+
+            private void showMenu() {
+              final ArrayList<String> names = new ArrayList<>();
+              final ArrayList<String> uris = new ArrayList<>();
+              try {
+                JSONArray arr = new JSONArray(prefs.getString("recents", "[]"));
+                for (int i = 0; i < arr.length(); i++) {
+                  JSONObject o = arr.getJSONObject(i);
+                  names.add(o.getString("name"));
+                  uris.add(o.getString("uri"));
+                }
+              } catch (Exception e) {
+              }
+              final ArrayList<String> labels = new ArrayList<>();
+              labels.add("Open file from storage...");
+              labels.add("Save As... (next Save asks where)");
+              labels.add("Auto-save: " + (autoSave ? "ON" : "OFF") + " (tap to switch)");
+              for (String n : names) labels.add("Recent: " + n);
+              new AlertDialog.Builder(this)
+                .setTitle("Files")
+                .setItems(labels.toArray(new String[0]), (d, which) -> {
+                  if (which == 0) {
+                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                    i.addCategory(Intent.CATEGORY_OPENABLE);
+                    i.setType("*/*");
+                    i.addFlags(RW | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+                    startActivityForResult(i, REQ_OPEN);
+                  } else if (which == 1) {
+                    forcePicker = true;
+                    toast("Press Save in the app to choose a new location");
+                  } else if (which == 2) {
+                    autoSave = !autoSave;
+                    prefs.edit().putBoolean("autosave", autoSave).apply();
+                    toast("Auto-save " + (autoSave ? "ON" : "OFF"));
+                  } else {
+                    String u = uris.get(which - 3);
+                    if (loadUri(Uri.parse(u))) {
+                      triggerOpen();
+                    } else {
+                      removeRecent(u);
+                    }
+                  }
+                })
+                .show();
+            }
+
+            private void addFilesButton() {
+              Button b = new Button(this);
+              b.setText("Files");
+              b.setAllCaps(false);
+              b.setTextSize(12);
+              b.setTextColor(0xFFFFFFFF);
+              GradientDrawable bg = new GradientDrawable();
+              bg.setColor(0xB3222222);
+              bg.setCornerRadius(dp(20));
+              b.setBackground(bg);
+              b.setMinWidth(0);
+              b.setMinHeight(0);
+              b.setPadding(dp(14), dp(8), dp(14), dp(8));
+              FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM | Gravity.END);
+              lp.setMargins(dp(8), dp(8), dp(16), dp(72));
+              addContentView(b, lp);
+              b.setOnTouchListener(new View.OnTouchListener() {
+                float offX, offY, startX, startY;
+                boolean moved;
+
+                @Override
+                public boolean onTouch(View v, MotionEvent e) {
+                  switch (e.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                      offX = v.getX() - e.getRawX();
+                      offY = v.getY() - e.getRawY();
+                      startX = e.getRawX();
+                      startY = e.getRawY();
+                      moved = false;
+                      return true;
+                    case MotionEvent.ACTION_MOVE:
+                      if (Math.abs(e.getRawX() - startX) > 15 || Math.abs(e.getRawY() - startY) > 15) moved = true;
+                      if (moved) {
+                        v.setX(e.getRawX() + offX);
+                        v.setY(e.getRawY() + offY);
+                      }
+                      return true;
+                    case MotionEvent.ACTION_UP:
+                      if (!moved) showMenu();
+                      return true;
+                    default:
+                      return false;
+                  }
+                }
+              });
             }
 
             public class Saver {
@@ -240,24 +523,17 @@ jobs:
               }
 
               @JavascriptInterface
-              public void save(String name, String mime, String b64) {
-                try {
-                  byte[] data = Base64.decode(b64, Base64.DEFAULT);
-                  String safe = name.replace("/", "_").replace("\\", "_");
-                  ContentValues v = new ContentValues();
-                  v.put(MediaStore.MediaColumns.DISPLAY_NAME, safe);
-                  v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
-                  v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
-                  Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
-                  if (uri != null) {
-                    OutputStream out = getContentResolver().openOutputStream(uri);
-                    out.write(data);
-                    out.close();
-                    toast("Saved to Downloads: " + safe);
-                  }
-                } catch (Exception e) {
-                  toast("Save failed: " + e.getMessage());
-                }
+              public boolean autoSaveReady() {
+                return autoSave && userSavedOnce && linkedUri != null;
+              }
+
+              @JavascriptInterface
+              public void save(String name, String mime, String b64, boolean auto) {
+                final byte[] data = Base64.decode(b64, Base64.DEFAULT);
+                final String n = name.replace("/", "_").replace("\\", "_");
+                final String m = mime;
+                final boolean a = auto;
+                runOnUiThread(() -> doSave(n, m, data, a));
               }
             }
           }
