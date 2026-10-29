@@ -29,10 +29,10 @@ jobs:
       - name: Choose app settings
         run: |
           case "$APP" in
-            vectorcraft)
+              vectorcraft)
               name="VectorCraft"
-              mimes="image/svg+xml,application/illustrator,application/postscript,application/eps,image/x-eps,application/pdf"
-              exts="svg,svgz,vectorcraft,ai,eps,dxf,emf,wmf,af,afdesign,afpub,afphoto,pdf"
+              mimes="image/svg+xml,application/illustrator,application/postscript,application/eps,image/x-eps,application/pdf,application/json"
+              exts="vectorcraft.json,vectorcraft,svg,svgz,ai,eps,dxf,emf,wmf,af,afdesign,afpub,afphoto,pdf"
               ;;
             wordcraft)
               name="WordCraft"
