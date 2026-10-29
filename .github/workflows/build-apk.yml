@@ -29,7 +29,7 @@ jobs:
       - name: Choose app settings
         run: |
           case "$APP" in
-              vectorcraft)
+            vectorcraft)
               name="VectorCraft"
               mimes="image/svg+xml,application/illustrator,application/postscript,application/eps,image/x-eps,application/pdf,application/json"
               exts="vectorcraft.json,vectorcraft,svg,svgz,ai,eps,dxf,emf,wmf,af,afdesign,afpub,afphoto,pdf"
@@ -179,6 +179,55 @@ jobs:
           EOF
           sed -i "s/__AUTOSAVE__/${AUTOSAVE:-30}/" www/android-save.js
           sed -i 's#</head>#<script src="android-save.js"></script></head>#' www/index.html
+
+      - name: PhotoCraft startup helpers
+        if: ${{ inputs.app == 'photocraft' }}
+        run: |
+          cat > www/android-diag.js <<'EOF'
+          (function () {
+            if (location.search.indexOf('webgl') === -1) {
+              location.replace(location.pathname + '?webgl');
+              return;
+            }
+            var logs = [];
+            function add(s) {
+              logs.push(String(s).slice(0, 300));
+              if (logs.length > 14) logs.shift();
+            }
+            window.addEventListener('error', function (e) {
+              add('ERROR ' + e.message + ' ' + (e.filename || ''));
+            }, true);
+            window.addEventListener('unhandledrejection', function (e) {
+              add('REJECTED ' + (e.reason && (e.reason.message || e.reason)));
+            });
+            var ce = console.error;
+            console.error = function () {
+              add('console.error ' + Array.prototype.join.call(arguments, ' '));
+              return ce.apply(console, arguments);
+            };
+            var of = window.fetch;
+            window.fetch = function (u) {
+              var url = (u && u.url) || u;
+              return of.apply(this, arguments).then(function (r) {
+                if (!r.ok) add('HTTP ' + r.status + ' ' + url);
+                return r;
+              }, function (e) {
+                add('FETCH FAILED ' + url + ' ' + e);
+                throw e;
+              });
+            };
+            setTimeout(function () {
+              if (document.body.innerText.indexOf('Loading') === -1) return;
+              var gl2 = false;
+              try { gl2 = !!document.createElement('canvas').getContext('webgl2'); } catch (e) {}
+              var d = document.createElement('pre');
+              d.style.cssText = 'position:fixed;left:8px;right:8px;top:8px;max-height:45%;overflow:auto;background:rgba(0,0,0,0.85);color:#ffe27a;font:12px monospace;padding:8px;z-index:99999;white-space:pre-wrap';
+              d.textContent = 'Startup log (screenshot this)\n' + 'WebGL2: ' + gl2 + ' | WebGPU: ' + !!navigator.gpu + ' | secure: ' + window.isSecureContext + '\n' + (logs.join('\n') || '(no errors captured)');
+              document.body.appendChild(d);
+            }, 25000);
+          })();
+          EOF
+          sed -i 's#</head>#<script src="android-diag.js"></script></head>#' www/index.html
 
       - name: Create the Android project
         run: |
