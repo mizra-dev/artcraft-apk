@@ -183,6 +183,14 @@ jobs:
       - name: PhotoCraft startup helpers
         if: ${{ inputs.app == 'photocraft' }}
         run: |
+          if ls www/app/*.part-* > /dev/null 2>&1; then
+            for f in www/app/*.part-*; do mv "$f" "$f.bin"; done
+            for t in www/index.html www/app/parts.txt www/app/photocraft-web.js www/photocraft-web-boot-*.js; do
+              if [ -f "$t" ]; then sed -i -E 's/(\.part-[a-z]+)/\1.bin/g' "$t"; fi
+            done
+          fi
+          ls www/app
+          cat www/app/parts.txt
           cat > www/android-diag.js <<'EOF'
           (function () {
             if (location.search.indexOf('webgl') === -1) {
@@ -191,20 +199,27 @@ jobs:
             }
             var logs = [];
             function add(s) {
-              logs.push(String(s).slice(0, 300));
-              if (logs.length > 14) logs.shift();
+              logs.push(String(s).slice(0, 240));
+              if (logs.length > 30) logs.shift();
             }
             window.addEventListener('error', function (e) {
-              add('ERROR ' + e.message + ' ' + (e.filename || ''));
+              var t = e.target;
+              if (t && t !== window && (t.src || t.href)) {
+                add('LOAD ERROR <' + t.tagName + '> ' + (t.src || t.href));
+              } else {
+                add('ERROR ' + e.message + ' ' + (e.filename || '') + ':' + (e.lineno || ''));
+              }
             }, true);
             window.addEventListener('unhandledrejection', function (e) {
               add('REJECTED ' + (e.reason && (e.reason.message || e.reason)));
             });
-            var ce = console.error;
-            console.error = function () {
-              add('console.error ' + Array.prototype.join.call(arguments, ' '));
-              return ce.apply(console, arguments);
-            };
+            ['error', 'warn', 'log', 'info'].forEach(function (k) {
+              var o = console[k];
+              console[k] = function () {
+                add('console.' + k + ' ' + Array.prototype.join.call(arguments, ' '));
+                return o.apply(console, arguments);
+              };
+            });
             var of = window.fetch;
             window.fetch = function (u) {
               var url = (u && u.url) || u;
@@ -220,9 +235,17 @@ jobs:
               if (document.body.innerText.indexOf('Loading') === -1) return;
               var gl2 = false;
               try { gl2 = !!document.createElement('canvas').getContext('webgl2'); } catch (e) {}
+              var chrome = (navigator.userAgent.match(/Chrome\/[\d.]+/) || ['?'])[0];
+              var res = performance.getEntriesByType('resource').map(function (r) {
+                return (r.responseStatus || '?') + ' ' + Math.round((r.transferSize || 0) / 1024) + 'KB ' + r.name.replace(location.origin, '');
+              });
               var d = document.createElement('pre');
-              d.style.cssText = 'position:fixed;left:8px;right:8px;top:8px;max-height:45%;overflow:auto;background:rgba(0,0,0,0.85);color:#ffe27a;font:12px monospace;padding:8px;z-index:99999;white-space:pre-wrap';
-              d.textContent = 'Startup log (screenshot this)\n' + 'WebGL2: ' + gl2 + ' | WebGPU: ' + !!navigator.gpu + ' | secure: ' + window.isSecureContext + '\n' + (logs.join('\n') || '(no errors captured)');
+              d.style.cssText = 'position:fixed;left:8px;right:8px;top:8px;max-height:80%;overflow:auto;background:rgba(0,0,0,0.9);color:#ffe27a;font:11px monospace;padding:8px;z-index:99999;white-space:pre-wrap';
+              d.textContent = 'Startup log (screenshot this)\n' +
+                chrome + ' | WebGL2: ' + gl2 + ' | WebGPU: ' + !!navigator.gpu +
+                ' | DecompStream: ' + (typeof DecompressionStream) + '\n' +
+                '--- files loaded\n' + (res.slice(-20).join('\n') || '(none)') +
+                '\n--- messages\n' + (logs.slice(-20).join('\n') || '(none)');
               document.body.appendChild(d);
             }, 25000);
           })();
