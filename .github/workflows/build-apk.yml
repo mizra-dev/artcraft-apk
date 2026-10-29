@@ -11,10 +11,16 @@ on:
         default: "VectorCraft"
       app_id:
         description: "App ID (lowercase, no spaces)"
-        default: "com.example.vectorcraft"
+        default: "com.mizra.vectorcraft"
       icon:
         description: "Icon file name without .png"
         default: "vectorcraft"
+      mime_types:
+        description: "File MIME types to open (comma separated)"
+        default: "image/svg+xml"
+      extensions:
+        description: "File extensions to open (comma separated, no dots)"
+        default: "svg,vectorcraft"
 
 jobs:
   build:
@@ -24,16 +30,21 @@ jobs:
       APP_NAME: ${{ inputs.app_name }}
       APP_ID: ${{ inputs.app_id }}
       ICON: ${{ inputs.icon }}
+      MIMES: ${{ inputs.mime_types }}
+      EXTS: ${{ inputs.extensions }}
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 21
+
       - name: Download the web build
         run: |
           mkdir -p dl unz www
@@ -43,19 +54,22 @@ jobs:
           idx=$(find unz -name index.html | head -n 1)
           cp -r "$(dirname "$idx")"/. www/
           ls www
-      - name: Enable file saving (web part)
+
+      - name: Inject save and open bridge
         run: |
           cat > www/android-save.js <<'EOF'
           (function () {
             function save(a) {
-              var name = a.getAttribute('download') || 'file';
+              var name = a.getAttribute('download') || 'export';
               fetch(a.href)
                 .then(function (r) { return r.blob(); })
                 .then(function (b) {
                   var rd = new FileReader();
                   rd.onloadend = function () {
                     var data = String(rd.result).split(',')[1] || '';
-                    window.AndroidSaver.save(name, b.type || 'application/octet-stream', data);
+                    if (window.AndroidSaver) {
+                      window.AndroidSaver.save(name, b.type || 'application/octet-stream', data);
+                    }
                   };
                   rd.readAsDataURL(b);
                 });
@@ -77,8 +91,50 @@ jobs:
             }, true);
           })();
           EOF
+          cat >> www/android-save.js <<'EOF'
+          (function () {
+            function b64ToFile(b64, name, mime) {
+              var bin = atob(b64);
+              var bytes = new Uint8Array(bin.length);
+              for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+              return new File([bytes], name, { type: mime || 'application/octet-stream' });
+            }
+            function fire(target, type, dt) {
+              var ev;
+              try {
+                ev = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt });
+              } catch (e) {
+                ev = new Event(type, { bubbles: true, cancelable: true });
+                ev.dataTransfer = dt;
+              }
+              target.dispatchEvent(ev);
+            }
+            window.__openPending = function () {
+              if (!window.AndroidSaver || !window.AndroidSaver.pendingName) return;
+              var name = window.AndroidSaver.pendingName();
+              if (!name) return;
+              var mime = window.AndroidSaver.pendingMime();
+              var file = b64ToFile(window.AndroidSaver.pendingData(), name, mime);
+              var dt = new DataTransfer();
+              dt.items.add(file);
+              var target = document.querySelector('canvas') || document.body;
+              fire(target, 'dragenter', dt);
+              fire(target, 'dragover', dt);
+              fire(target, 'drop', dt);
+            };
+            var tries = 0;
+            function waitForApp() {
+              if (document.querySelector('canvas') || tries++ > 30) {
+                setTimeout(window.__openPending, 1500);
+              } else {
+                setTimeout(waitForApp, 500);
+              }
+            }
+            window.addEventListener('load', waitForApp);
+          })();
+          EOF
           sed -i 's#</head>#<script src="android-save.js"></script></head>#' www/index.html
-          grep -c "android-save" www/index.html || echo "WARNING: could not add save script"
+
       - name: Create the Android project
         run: |
           npm init -y
@@ -86,7 +142,8 @@ jobs:
           npx cap init "$APP_NAME" "$APP_ID" --web-dir www
           npx cap add android
           npx cap sync android
-      - name: Enable file saving (Android part)
+
+      - name: Inject MainActivity
         run: |
           dir="android/app/src/main/java/$(echo "$APP_ID" | tr . /)"
           mkdir -p "$dir"
@@ -94,36 +151,97 @@ jobs:
           package __PKG__;
 
           import android.content.ContentValues;
+          import android.content.Intent;
+          import android.database.Cursor;
           import android.net.Uri;
-          import android.os.Build;
           import android.os.Bundle;
           import android.os.Environment;
           import android.provider.MediaStore;
+          import android.provider.OpenableColumns;
           import android.util.Base64;
           import android.webkit.JavascriptInterface;
           import android.widget.Toast;
           import com.getcapacitor.BridgeActivity;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
           import java.io.OutputStream;
 
           public class MainActivity extends BridgeActivity {
+            private String pName = "";
+            private String pMime = "";
+            private String pData = "";
+
             @Override
             public void onCreate(Bundle savedInstanceState) {
               super.onCreate(savedInstanceState);
               getBridge().getWebView().addJavascriptInterface(new Saver(), "AndroidSaver");
+              readIncoming(getIntent());
+            }
+
+            @Override
+            protected void onNewIntent(Intent intent) {
+              super.onNewIntent(intent);
+              setIntent(intent);
+              readIncoming(intent);
+              getBridge().getWebView().post(() ->
+                getBridge().getWebView().evaluateJavascript(
+                  "window.__openPending && window.__openPending()", null));
             }
 
             private void toast(final String msg) {
-              runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_LONG).show());
+              runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show());
+            }
+
+            private void readIncoming(Intent intent) {
+              try {
+                if (intent == null || !Intent.ACTION_VIEW.equals(intent.getAction())) return;
+                Uri uri = intent.getData();
+                if (uri == null) return;
+                String name = null;
+                Cursor c = getContentResolver().query(uri, null, null, null, null);
+                if (c != null) {
+                  try {
+                    int i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (i >= 0 && c.moveToFirst()) name = c.getString(i);
+                  } finally {
+                    c.close();
+                  }
+                }
+                if (name == null) name = uri.getLastPathSegment();
+                if (name == null) name = "file";
+                String mime = getContentResolver().getType(uri);
+                InputStream in = getContentResolver().openInputStream(uri);
+                ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                byte[] chunk = new byte[65536];
+                int n;
+                while ((n = in.read(chunk)) > 0) buf.write(chunk, 0, n);
+                in.close();
+                pData = Base64.encodeToString(buf.toByteArray(), Base64.NO_WRAP);
+                pMime = (mime == null) ? "application/octet-stream" : mime;
+                pName = name;
+              } catch (Exception e) {
+                toast("Could not open file: " + e.getMessage());
+              }
             }
 
             public class Saver {
               @JavascriptInterface
+              public String pendingName() { return pName; }
+
+              @JavascriptInterface
+              public String pendingMime() { return pMime; }
+
+              @JavascriptInterface
+              public String pendingData() {
+                String d = pData;
+                pData = "";
+                pName = "";
+                return d;
+              }
+
+              @JavascriptInterface
               public void save(String name, String mime, String b64) {
                 try {
-                  if (Build.VERSION.SDK_INT < 29) {
-                    toast("Saving needs Android 10 or newer");
-                    return;
-                  }
                   byte[] data = Base64.decode(b64, Base64.DEFAULT);
                   String safe = name.replace("/", "_").replace("\\", "_");
                   ContentValues v = new ContentValues();
@@ -131,10 +249,12 @@ jobs:
                   v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
                   v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
                   Uri uri = getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, v);
-                  OutputStream out = getContentResolver().openOutputStream(uri);
-                  out.write(data);
-                  out.close();
-                  toast("Saved to Downloads: " + safe);
+                  if (uri != null) {
+                    OutputStream out = getContentResolver().openOutputStream(uri);
+                    out.write(data);
+                    out.close();
+                    toast("Saved to Downloads: " + safe);
+                  }
                 } catch (Exception e) {
                   toast("Save failed: " + e.getMessage());
                 }
@@ -143,22 +263,62 @@ jobs:
           }
           EOF
           sed -i "s/__PKG__/$APP_ID/" "$dir/MainActivity.java"
+
+      - name: Make the app open files
+        run: |
+          python3 - <<'PY'
+          import os
+          mf = 'android/app/src/main/AndroidManifest.xml'
+          s = open(mf).read()
+          mimes = [m.strip() for m in os.environ.get('MIMES', '').split(',') if m.strip()]
+          exts = [e.strip().lstrip('.') for e in os.environ.get('EXTS', '').split(',') if e.strip()]
+          head = ('<intent-filter>\n'
+                  '<action android:name="android.intent.action.VIEW"/>\n'
+                  '<category android:name="android.intent.category.DEFAULT"/>\n'
+                  '<category android:name="android.intent.category.BROWSABLE"/>\n'
+                  '<data android:scheme="content"/>\n'
+                  '<data android:scheme="file"/>\n')
+          out = ''
+          if mimes:
+              out += head
+              for m in mimes:
+                  out += '<data android:mimeType="%s"/>\n' % m
+              out += '</intent-filter>\n'
+          if exts:
+              out += head
+              out += '<data android:host="*"/>\n<data android:mimeType="*/*"/>\n'
+              for e in exts:
+                  for x in {e, e.upper()}:
+                      out += '<data android:pathPattern=".*\\\\.%s"/>\n' % x
+                      out += '<data android:pathPattern=".*\\\\..*\\\\.%s"/>\n' % x
+              out += '</intent-filter>\n'
+          s = s.replace('</activity>', out + '</activity>', 1)
+          open(mf, 'w').write(s)
+          PY
+          grep -c "intent-filter" android/app/src/main/AndroidManifest.xml
+
       - name: Apply custom icon
         run: |
           if [ -f "$ICON.png" ]; then
             mkdir -p assets
             cp "$ICON.png" assets/icon-only.png
             cp "$ICON.png" assets/icon-foreground.png
+            cp "$ICON.png" assets/icon-background.png
             npm i -D @capacitor/assets
             npx capacitor-assets generate --android --iconBackgroundColor '#ffffff' --iconBackgroundColorDark '#ffffff'
+
+            mkdir -p android/app/src/main/res/values
+            printf '<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#FFFFFF</color>\n</resources>\n' > android/app/src/main/res/values/ic_launcher_background.xml
           else
-            echo "No $ICON.png found, keeping the default icon"
+            echo "No $ICON.png found, keeping default icon"
           fi
+
       - name: Build the APK
         run: |
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.app_name }}-apk
