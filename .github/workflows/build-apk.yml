@@ -183,13 +183,15 @@ jobs:
       - name: PhotoCraft startup helpers
         if: ${{ inputs.app == 'photocraft' }}
         run: |
-          if [ -d www/snippets ] && [ -d www/app ]; then
-            cp -r www/snippets www/app/
+          if [ -d www/snippets ]; then
+            mkdir -p www/app/snippets
+            cp -r www/snippets/. www/app/snippets/ || true
           fi
+          find www -name 'inline0.js'
           if ls www/app/*.part-* > /dev/null 2>&1; then
             for f in www/app/*.part-*; do mv "$f" "$f.bin"; done
             for t in www/index.html www/app/parts.txt www/app/photocraft-web.js www/photocraft-web-boot-*.js; do
-              if [ -f "$t" ]; then sed -i -E 's/(\.part-[a-zA-Z0-9]+)/\1.bin/g' "$t"; fi
+              if [ -f "$t" ]; then sed -i -E 's/(\.part-[a-z]+)/\1.bin/g' "$t"; fi
             done
           fi
           ls www/app
