@@ -86,20 +86,55 @@ jobs:
         run: |
           cat > www/android-save.js <<'EOF'
           (function () {
+            var blobs = {};
+            var oCreate = URL.createObjectURL.bind(URL);
+            URL.createObjectURL = function (obj) {
+              var u = oCreate(obj);
+              try { if (obj instanceof Blob) blobs[u] = obj; } catch (e) {}
+              return u;
+            };
+            var oRevoke = URL.revokeObjectURL.bind(URL);
+            URL.revokeObjectURL = function (u) {
+              setTimeout(function () { delete blobs[u]; }, 60000);
+              return oRevoke(u);
+            };
+            function banner(msg) {
+              if (window.__autosaving || !document.body) return;
+              var d = document.getElementById('__sv');
+              if (!d) {
+                d = document.createElement('div');
+                d.id = '__sv';
+                d.style.cssText = 'position:fixed;left:12px;bottom:12px;background:rgba(0,0,0,0.85);color:#fff;font:13px sans-serif;padding:8px 12px;border-radius:8px;z-index:99999';
+                document.body.appendChild(d);
+              }
+              d.textContent = msg;
+              d.style.display = 'block';
+              clearTimeout(d.__t);
+              d.__t = setTimeout(function () { d.style.display = 'none'; }, 3500);
+            }
+            function sendBlob(name, blob) {
+              banner('Saving ' + name + ' ...');
+              var rd = new FileReader();
+              rd.onloadend = function () {
+                var data = String(rd.result).split(',')[1] || '';
+                if (window.AndroidSaver) {
+                  window.AndroidSaver.save(name, blob.type || 'application/octet-stream', data, !!window.__autosaving);
+                }
+              };
+              rd.readAsDataURL(blob);
+            }
             function save(a) {
               var name = a.getAttribute('download') || 'export';
-              fetch(a.href)
+              var href = a.href;
+              var b = blobs[href];
+              if (b) {
+                sendBlob(name, b);
+                return;
+              }
+              fetch(href)
                 .then(function (r) { return r.blob(); })
-                .then(function (b) {
-                  var rd = new FileReader();
-                  rd.onloadend = function () {
-                    var data = String(rd.result).split(',')[1] || '';
-                    if (window.AndroidSaver) {
-                      window.AndroidSaver.save(name, b.type || 'application/octet-stream', data, !!window.__autosaving);
-                    }
-                  };
-                  rd.readAsDataURL(b);
-                });
+                .then(function (bl) { sendBlob(name, bl); })
+                .catch(function (e) { banner('Save failed: ' + e); });
             }
             var origClick = HTMLAnchorElement.prototype.click;
             HTMLAnchorElement.prototype.click = function () {
@@ -109,6 +144,15 @@ jobs:
               }
               return origClick.apply(this, arguments);
             };
+            var origDispatch = EventTarget.prototype.dispatchEvent;
+            EventTarget.prototype.dispatchEvent = function (ev) {
+              if (window.AndroidSaver && ev && ev.type === 'click' &&
+                  this instanceof HTMLAnchorElement && this.hasAttribute('download')) {
+                save(this);
+                return true;
+              }
+              return origDispatch.apply(this, arguments);
+            };
             document.addEventListener('click', function (e) {
               var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
               if (a && window.AndroidSaver) {
@@ -116,6 +160,16 @@ jobs:
                 save(a);
               }
             }, true);
+            var oOpen = window.open;
+            window.open = function (u) {
+              if (window.AndroidSaver && typeof u === 'string' && u.indexOf('blob:') === 0 && blobs[u]) {
+                var b = blobs[u];
+                var map = { 'application/pdf': 'pdf', 'text/html': 'html', 'text/plain': 'txt', 'image/png': 'png' };
+                sendBlob('document.' + (map[b.type] || 'bin'), b);
+                return null;
+              }
+              return oOpen.apply(window, arguments);
+            };
           })();
           EOF
           cat >> www/android-save.js <<'EOF'
