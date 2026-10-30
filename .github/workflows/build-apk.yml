@@ -82,20 +82,21 @@ jobs:
           cp -r "$(dirname "$idx")"/. www/
           ls www
 
-      - name: Inject save and open bridge
+      - name: Inject save, open, and share bridge
         run: |
           cat > www/android-save.js <<'EOF'
           (function () {
             var blobs = {};
             var names = {};
             var lastDl = null;
-            var saved = 0;
             var extFor = {
               'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+              'application/msword': 'doc',
               'application/pdf': 'pdf',
               'text/html': 'html',
               'text/plain': 'txt',
               'text/markdown': 'md',
+              'text/x-markdown': 'md',
               'application/rtf': 'rtf',
               'text/rtf': 'rtf',
               'application/vnd.oasis.opendocument.text': 'odt',
@@ -105,50 +106,91 @@ jobs:
               'text/xml': 'xml',
               'image/png': 'png',
               'image/jpeg': 'jpg',
+              'image/webp': 'webp',
               'image/svg+xml': 'svg',
               'application/json': 'json'
             };
-            function banner(msg) {
-              if (window.__autosaving || !document.body) return;
-              var d = document.getElementById('__sv');
-              if (!d) {
-                d = document.createElement('div');
-                d.id = '__sv';
-                d.style.cssText = 'position:fixed;left:12px;bottom:12px;max-width:70%;background:rgba(0,0,0,0.9);color:#fff;font:13px sans-serif;padding:8px 12px;border-radius:8px;z-index:99999';
-                document.body.appendChild(d);
-              }
-              d.textContent = msg;
-              d.style.display = 'block';
-              clearTimeout(d.__t);
-              d.__t = setTimeout(function () { d.style.display = 'none'; }, 6000);
+            var mimeFor = {
+              docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              doc: 'application/msword',
+              pdf: 'application/pdf',
+              html: 'text/html',
+              htm: 'text/html',
+              txt: 'text/plain',
+              md: 'text/markdown',
+              rtf: 'application/rtf',
+              odt: 'application/vnd.oasis.opendocument.text',
+              tex: 'text/x-tex',
+              xml: 'application/xml',
+              json: 'application/json',
+              svg: 'image/svg+xml',
+              png: 'image/png',
+              jpg: 'image/jpeg',
+              jpeg: 'image/jpeg',
+              webp: 'image/webp'
+            };
+
+            function guessMime(name, fallback) {
+              if (fallback && fallback !== 'application/octet-stream') return fallback;
+              var m = /\.([a-z0-9]+)$/i.exec(name || '');
+              if (m && mimeFor[m[1].toLowerCase()]) return mimeFor[m[1].toLowerCase()];
+              return fallback || 'application/octet-stream';
             }
-            function sendBlob(name, blob) {
-              saved = Date.now();
-              banner('Saving ' + name + ' ...');
+
+            function ensureName(name, mime) {
+              var n = (name || '').trim() || 'document';
+              if (n.indexOf('.') === -1) {
+                var ext = extFor[mime] || 'docx';
+                n += '.' + ext;
+              }
+              return n;
+            }
+
+            function blobToB64(blob, cb) {
               var rd = new FileReader();
               rd.onloadend = function () {
-                var data = String(rd.result).split(',')[1] || '';
-                if (window.AndroidSaver) {
-                  window.AndroidSaver.save(name, blob.type || 'application/octet-stream', data, !!window.__autosaving);
-                }
+                var data = String(rd.result || '').split(',')[1] || '';
+                cb(data);
               };
               rd.readAsDataURL(blob);
             }
+
+            function sendBlob(name, blob) {
+              if (!(blob instanceof Blob)) {
+                blob = new Blob([blob || ''], { type: 'application/octet-stream' });
+              }
+              var mime = guessMime(name, blob.type);
+              var finalName = ensureName(name, mime);
+              blobToB64(blob, function (data) {
+                if (window.AndroidSaver) {
+                  window.AndroidSaver.save(finalName, mime, data, !!window.__autosaving);
+                }
+              });
+            }
+
+            function sendShareBlob(name, blob, title) {
+              if (!(blob instanceof Blob)) {
+                blob = new Blob([blob || ''], { type: 'application/octet-stream' });
+              }
+              var mime = guessMime(name, blob.type);
+              var finalName = ensureName(name, mime);
+              blobToB64(blob, function (data) {
+                if (window.AndroidSaver && window.AndroidSaver.shareFile) {
+                  window.AndroidSaver.shareFile(finalName, mime, data, title || '');
+                } else if (window.AndroidSaver) {
+                  window.AndroidSaver.save(finalName, mime, data, false);
+                }
+              });
+            }
+
+            // 1. Track Object URLs & File objects
             var oCreate = URL.createObjectURL.bind(URL);
             URL.createObjectURL = function (obj) {
               var u = oCreate(obj);
               try {
                 if (obj instanceof Blob) {
                   blobs[u] = obj;
-                  var ty = String(obj.type || '');
-                  if (obj.size > 1024 && !/^(image|font|video|audio)\//.test(ty) && !/javascript|wasm/.test(ty)) {
-                    var t0 = Date.now();
-                    setTimeout(function () {
-                      if (saved < t0) {
-                        banner('A file was made (' + (ty || 'unknown type') + ', ' + obj.size + ' bytes) but no download was caught. showSaveFilePicker: ' + typeof window.showSaveFilePicker);
-                      }
-                    }, 2500);
-                  }
+                  if (obj.name) names[u] = obj.name;
                 }
               } catch (e) {}
               return u;
@@ -158,33 +200,40 @@ jobs:
               setTimeout(function () { delete blobs[u]; }, 60000);
               return oRevoke(u);
             };
+
+            // 2. Track <a download> attributes and clicks
             function note(a) {
               try {
                 var n = a.getAttribute('download');
                 if (n !== null) {
                   var h = a.href;
-                  if (h) names[h] = n || 'export';
-                  lastDl = { name: n || 'export', t: Date.now() };
+                  if (h) names[h] = n || 'document';
+                  lastDl = { name: n || 'document', t: Date.now() };
                 }
               } catch (e) {}
             }
             try {
               var A = HTMLAnchorElement.prototype;
               var dd = Object.getOwnPropertyDescriptor(A, 'download');
-              Object.defineProperty(A, 'download', {
-                configurable: true,
-                enumerable: dd.enumerable,
-                get: dd.get,
-                set: function (v) { dd.set.call(this, v); note(this); }
-              });
               var hd = Object.getOwnPropertyDescriptor(A, 'href');
-              Object.defineProperty(A, 'href', {
-                configurable: true,
-                enumerable: hd.enumerable,
-                get: hd.get,
-                set: function (v) { hd.set.call(this, v); note(this); }
-              });
+              if (dd && dd.set) {
+                Object.defineProperty(A, 'download', {
+                  configurable: true,
+                  enumerable: dd.enumerable,
+                  get: dd.get,
+                  set: function (v) { dd.set.call(this, v); note(this); }
+                });
+              }
+              if (hd && hd.set) {
+                Object.defineProperty(A, 'href', {
+                  configurable: true,
+                  enumerable: hd.enumerable,
+                  get: hd.get,
+                  set: function (v) { hd.set.call(this, v); note(this); }
+                });
+              }
             } catch (e) {}
+
             var oSet = Element.prototype.setAttribute;
             Element.prototype.setAttribute = function (k, v) {
               var r = oSet.apply(this, arguments);
@@ -193,19 +242,32 @@ jobs:
               } catch (e) {}
               return r;
             };
-            function save(a) {
-              var href = a.href;
-              var name = a.getAttribute('download') || names[href] || 'export';
-              var b = blobs[href];
-              if (b) {
-                sendBlob(name, b);
+
+            function saveAnchor(a) {
+              var href = a.href || a.getAttribute('href') || '';
+              var name = a.getAttribute('download') || names[href] || 'document';
+              if (blobs[href]) {
+                sendBlob(name, blobs[href]);
+                return;
+              }
+              if (href.indexOf('data:') === 0) {
+                var parts = href.split(',');
+                var meta = parts[0] || '';
+                var body = parts.slice(1).join(',');
+                var mimeMatch = /^data:([^;,]+)/i.exec(meta);
+                var mime = guessMime(name, mimeMatch ? mimeMatch[1] : 'text/plain');
+                var isB64 = /;base64/i.test(meta);
+                var b64 = isB64 ? body : btoa(unescape( decodeURIComponent(body) ));
+                if (window.AndroidSaver) {
+                  window.AndroidSaver.save(ensureName(name, mime), mime, b64, !!window.__autosaving);
+                }
                 return;
               }
               fetch(href)
                 .then(function (r) { return r.blob(); })
-                .then(function (bl) { sendBlob(name, bl); })
-                .catch(function (e) { banner('Save failed: ' + e); });
+                .then(function (bl) { sendBlob(name, bl); });
             }
+
             window.__nativeDownload = function (url, cd, mime) {
               var name = names[url];
               if (!name && cd) {
@@ -215,61 +277,203 @@ jobs:
                 }
               }
               if (!name && lastDl && Date.now() - lastDl.t < 5000) name = lastDl.name;
-              if (!name) name = 'document.' + (extFor[mime] || 'bin');
-              var b = blobs[url];
-              if (b) {
-                sendBlob(name, b);
+              if (!name) name = ensureName('document', mime);
+              if (blobs[url]) {
+                sendBlob(name, blobs[url]);
                 return;
               }
               fetch(url)
                 .then(function (r) { return r.blob(); })
-                .then(function (bl) { sendBlob(name, bl); })
-                .catch(function (e) { banner('Save failed: ' + e); });
+                .then(function (bl) { sendBlob(name, bl); });
             };
-            var origClick = HTMLAnchorElement.prototype.click;
+
+            var origAnchorClick = HTMLAnchorElement.prototype.click;
             HTMLAnchorElement.prototype.click = function () {
-              if (window.AndroidSaver && this.hasAttribute('download')) {
-                save(this);
+              if (window.AndroidSaver && (this.hasAttribute('download') || (this.href && this.href.indexOf('blob:') === 0))) {
+                saveAnchor(this);
                 return;
               }
-              return origClick.apply(this, arguments);
+              return origAnchorClick.apply(this, arguments);
             };
+
             var origDispatch = EventTarget.prototype.dispatchEvent;
             EventTarget.prototype.dispatchEvent = function (ev) {
-              if (window.AndroidSaver && ev && ev.type === 'click' &&
-                  this instanceof HTMLAnchorElement && this.hasAttribute('download')) {
-                save(this);
-                return true;
+              if (window.AndroidSaver && ev && ev.type === 'click') {
+                if (this instanceof HTMLAnchorElement && (this.hasAttribute('download') || (this.href && this.href.indexOf('blob:') === 0))) {
+                  saveAnchor(this);
+                  return true;
+                }
+                if (this instanceof HTMLInputElement && this.type === 'file') {
+                  window.__lastFileInput = this;
+                  if (window.AndroidSaver.pickFile) {
+                    window.AndroidSaver.pickFile();
+                    return true;
+                  }
+                }
               }
               return origDispatch.apply(this, arguments);
             };
+
             document.addEventListener('click', function (e) {
-              var a = e.target && e.target.closest ? e.target.closest('a[download]') : null;
+              var a = e.target && e.target.closest ? e.target.closest('a[download], a[href^="blob:"]') : null;
               if (a && window.AndroidSaver) {
                 e.preventDefault();
-                save(a);
+                e.stopPropagation();
+                saveAnchor(a);
+                return;
+              }
+              var inp = e.target && e.target.closest ? e.target.closest('input[type="file"]') : null;
+              if (inp && window.AndroidSaver && window.AndroidSaver.pickFile) {
+                e.preventDefault();
+                e.stopPropagation();
+                window.__lastFileInput = inp;
+                window.AndroidSaver.pickFile();
               }
             }, true);
+
             var oOpen = window.open;
             window.open = function (u) {
               if (window.AndroidSaver && typeof u === 'string' && u.indexOf('blob:') === 0 && blobs[u]) {
                 var b = blobs[u];
-                sendBlob('document.' + (extFor[b.type] || 'bin'), b);
+                sendBlob(names[u] || ensureName('document', b.type), b);
                 return null;
               }
               return oOpen.apply(window, arguments);
             };
-          })();
-          EOF
-          cat >> www/android-save.js <<'EOF'
-          (function () {
+
+            // 3. Polyfill File System Access API: showSaveFilePicker & showOpenFilePicker
+            function makeWritable(suggestedName, fallbackMime) {
+              var chunks = [];
+              return {
+                write: function (d) {
+                  if (d && typeof d === 'object' && d.type === 'write' && 'data' in d) d = d.data;
+                  if (d !== undefined && d !== null) chunks.push(d);
+                  return Promise.resolve();
+                },
+                seek: function () { return Promise.resolve(); },
+                truncate: function () { return Promise.resolve(); },
+                close: function () {
+                  var mime = guessMime(suggestedName, fallbackMime);
+                  var blob = new Blob(chunks, { type: mime });
+                  sendBlob(suggestedName, blob);
+                  return Promise.resolve();
+                },
+                abort: function () { return Promise.resolve(); }
+              };
+            }
+
+            window.showSaveFilePicker = function (opts) {
+              opts = opts || {};
+              var name = opts.suggestedName || 'document';
+              var mime = 'application/octet-stream';
+              if (opts.types && opts.types.length && opts.types[0].accept) {
+                var acc = opts.types[0].accept;
+                var firstMime = Object.keys(acc)[0];
+                if (firstMime) {
+                  mime = firstMime;
+                  var exts = acc[firstMime];
+                  if (name.indexOf('.') === -1 && exts && exts.length) {
+                    name += exts[0];
+                  }
+                }
+              }
+              name = ensureName(name, guessMime(name, mime));
+              var handle = {
+                kind: 'file',
+                name: name,
+                getFile: function () {
+                  return Promise.resolve(new File([], name, { type: guessMime(name, mime) }));
+                },
+                createWritable: function () {
+                  return Promise.resolve(makeWritable(name, mime));
+                },
+                queryPermission: function () { return Promise.resolve('granted'); },
+                requestPermission: function () { return Promise.resolve('granted'); }
+              };
+              return Promise.resolve(handle);
+            };
+
+            window.showOpenFilePicker = function (opts) {
+              return new Promise(function (resolve, reject) {
+                window.__openPickerResolve = resolve;
+                window.__openPickerReject = reject;
+                if (window.AndroidSaver && window.AndroidSaver.pickFile) {
+                  window.AndroidSaver.pickFile();
+                } else {
+                  reject(new Error('File picker unavailable'));
+                }
+              });
+            };
+
+            // 4. Intercept programmatic <input type="file">.click()
+            var origInputClick = HTMLInputElement.prototype.click;
+            HTMLInputElement.prototype.click = function () {
+              if (this.type === 'file' && window.AndroidSaver && window.AndroidSaver.pickFile) {
+                window.__lastFileInput = this;
+                window.AndroidSaver.pickFile();
+                return;
+              }
+              return origInputClick.apply(this, arguments);
+            };
+
+            // 5. Polyfill Web Share API (navigator.share & navigator.canShare)
+            var shareFn = function (data) {
+              data = data || {};
+              return new Promise(function (resolve) {
+                if (data.files && data.files.length > 0) {
+                  var f = data.files[0];
+                  sendShareBlob(f.name || 'document', f, data.title || data.text || '');
+                  resolve();
+                  return;
+                }
+                if (data.url && data.url.indexOf('blob:') === 0 && blobs[data.url]) {
+                  var b = blobs[data.url];
+                  sendShareBlob(names[data.url] || ensureName('document', b.type), b, data.title || '');
+                  resolve();
+                  return;
+                }
+                var txt = [data.text, data.url].filter(Boolean).join('\n');
+                if (window.AndroidSaver && window.AndroidSaver.shareText) {
+                  window.AndroidSaver.shareText(data.title || 'Share', txt || document.title || '');
+                }
+                resolve();
+              });
+            };
+            var canShareFn = function () { return true; };
+            try {
+              Object.defineProperty(navigator, 'share', { value: shareFn, configurable: true, writable: true });
+              Object.defineProperty(navigator, 'canShare', { value: canShareFn, configurable: true, writable: true });
+            } catch (e) {
+              navigator.share = shareFn;
+              navigator.canShare = canShareFn;
+            }
+
+            // 6. Wire window.print() to Android native Print / Save as PDF
+            window.print = function () {
+              if (window.AndroidSaver && window.AndroidSaver.printPage) {
+                window.AndroidSaver.printPage(document.title || 'Document');
+              }
+            };
+
+            // 7. Handle window.prompt fallback for rfd WASM save dialogs
+            var origPrompt = window.prompt ? window.prompt.bind(window) : null;
+            window.prompt = function (msg, def) {
+              if (def && /\.[a-z0-9]{1,10}$/i.test(def)) return def;
+              var res = origPrompt ? origPrompt(msg, def) : def;
+              return res !== null && res !== undefined ? res : (def || 'document');
+            };
+
+            // 8. Deliver opened files to showOpenFilePicker, <input type="file">, and drop targets
             function b64ToFile(b64, name, mime) {
               var bin = atob(b64);
               var bytes = new Uint8Array(bin.length);
               for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-              return new File([bytes], name, { type: mime || 'application/octet-stream' });
+              var fixedMime = guessMime(name, mime);
+              return new File([bytes], name, { type: fixedMime, lastModified: Date.now() });
             }
-            function fire(target, type, dt) {
+
+            function fireDrop(target, type, dt) {
+              if (!target) return;
               var ev;
               try {
                 ev = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt });
@@ -277,24 +481,84 @@ jobs:
                 ev = new Event(type, { bubbles: true, cancelable: true });
                 ev.dataTransfer = dt;
               }
+              try {
+                if (!ev.dataTransfer) {
+                  Object.defineProperty(ev, 'dataTransfer', { value: dt, configurable: true });
+                }
+              } catch (e) {}
               target.dispatchEvent(ev);
             }
+
+            function feedInput(inp, dt) {
+              try {
+                Object.defineProperty(inp, 'files', {
+                  value: dt.files,
+                  configurable: true
+                });
+              } catch (e) {
+                try { inp.files = dt.files; } catch (e2) {}
+              }
+              inp.dispatchEvent(new Event('input', { bubbles: true }));
+              inp.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+
             window.__openPending = function () {
               if (!window.AndroidSaver || !window.AndroidSaver.pendingName) return;
               var name = window.AndroidSaver.pendingName();
               if (!name) return;
               var mime = window.AndroidSaver.pendingMime();
               var file = b64ToFile(window.AndroidSaver.pendingData(), name, mime);
+
+              // A. Resolve showOpenFilePicker if waiting
+              if (window.__openPickerResolve) {
+                var res = window.__openPickerResolve;
+                window.__openPickerResolve = null;
+                window.__openPickerReject = null;
+                res([{
+                  kind: 'file',
+                  name: file.name,
+                  getFile: function () { return Promise.resolve(file); },
+                  createWritable: function () { return Promise.resolve(makeWritable(file.name, file.type)); },
+                  queryPermission: function () { return Promise.resolve('granted'); },
+                  requestPermission: function () { return Promise.resolve('granted'); }
+                }]);
+                return;
+              }
+
               var dt = new DataTransfer();
               dt.items.add(file);
-              var target = document.querySelector('canvas') || document.body;
-              fire(target, 'dragenter', dt);
-              fire(target, 'dragover', dt);
-              fire(target, 'drop', dt);
+
+              // B. Feed active <input type="file"> if one triggered the picker
+              var activeInput = window.__lastFileInput;
+              window.__lastFileInput = null;
+              if (activeInput) {
+                feedInput(activeInput, dt);
+                return;
+              }
+
+              // C. Feed any <input type="file"> present in the DOM AND fire drop events
+              var anyInput = document.querySelector('input[type="file"]');
+              if (anyInput) {
+                feedInput(anyInput, dt);
+              }
+              var target = document.querySelector('canvas, [contenteditable="true"], main, #app, #root') || document.body;
+              ['dragenter', 'dragover', 'drop'].forEach(function (t) {
+                fireDrop(target, t, dt);
+              });
             };
+
+            window.__openCancelled = function () {
+              if (window.__openPickerReject) {
+                var rej = window.__openPickerReject;
+                window.__openPickerResolve = null;
+                window.__openPickerReject = null;
+                rej(new DOMException('The user aborted a request.', 'AbortError'));
+              }
+            };
+
             var tries = 0;
             function waitForApp() {
-              if (document.querySelector('canvas') || tries++ > 30) {
+              if (document.querySelector('canvas, [contenteditable="true"], main, #app, #root') || tries++ > 30) {
                 setTimeout(window.__openPending, 1500);
               } else {
                 setTimeout(waitForApp, 500);
@@ -310,7 +574,7 @@ jobs:
             setInterval(function () {
               if (!window.AndroidSaver || !window.AndroidSaver.autoSaveReady()) return;
               window.__autosaving = true;
-              var t = document.querySelector('canvas') || document.body;
+              var t = document.querySelector('canvas, [contenteditable="true"]') || document.body;
               ['keydown', 'keyup'].forEach(function (type) {
                 t.dispatchEvent(new KeyboardEvent(type, {
                   key: 's', code: 'KeyS', keyCode: 83, ctrlKey: true, bubbles: true, cancelable: true
@@ -321,7 +585,7 @@ jobs:
           })();
           EOF
           sed -i "s/__AUTOSAVE__/${AUTOSAVE:-30}/" www/android-save.js
-          sed -i 's#</head>#<script src="android-save.js"></script></head>#' www/index.html
+          sed -i 's#</head>#<script src="android-save.js"></script></head>#I' www/index.html
 
       - name: PhotoCraft startup helpers
         if: ${{ inputs.app == 'photocraft' }}
@@ -334,7 +598,7 @@ jobs:
           if ls www/app/*.part-* > /dev/null 2>&1; then
             for f in www/app/*.part-*; do mv "$f" "$f.bin"; done
             for t in www/index.html www/app/parts.txt www/app/photocraft-web.js www/photocraft-web-boot-*.js; do
-              if [ -f "$t" ]; then sed -i -E 's/(\.part-[a-z]+)/\1.bin/g' "$t"; fi
+              if [ -f "$t" ]; then sed -i -E 's/(\.part-[a-zA-Z0-9]+)/\1.bin/g' "$t"; fi
             done
           fi
           ls www/app
@@ -398,7 +662,7 @@ jobs:
             }, 25000);
           })();
           EOF
-          sed -i 's#</head>#<script src="android-diag.js"></script></head>#' www/index.html
+          sed -i 's#</head>#<script src="android-diag.js"></script></head>#I' www/index.html
 
       - name: Create the Android project
         run: |
@@ -410,29 +674,47 @@ jobs:
 
       - name: Inject MainActivity
         run: |
+          mkdir -p android/app/src/main/res/xml
+          cat > android/app/src/main/res/xml/file_paths.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <paths xmlns:android="http://schemas.android.com/apk/res/android">
+              <external-path name="my_images" path="." />
+              <cache-path name="my_cache_images" path="." />
+              <files-path name="my_files" path="." />
+          </paths>
+          EOF
+
           dir="android/app/src/main/java/$(echo "$APP_ID" | tr . /)"
           mkdir -p "$dir"
           cat > "$dir/MainActivity.java" <<'EOF'
           package __PKG__;
 
           import android.app.AlertDialog;
+          import android.content.Context;
           import android.content.Intent;
           import android.content.SharedPreferences;
           import android.database.Cursor;
           import android.graphics.drawable.GradientDrawable;
           import android.net.Uri;
           import android.os.Bundle;
+          import android.print.PrintAttributes;
+          import android.print.PrintDocumentAdapter;
+          import android.print.PrintManager;
           import android.provider.OpenableColumns;
           import android.util.Base64;
           import android.view.Gravity;
           import android.view.MotionEvent;
           import android.view.View;
           import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
           import android.widget.Button;
           import android.widget.FrameLayout;
           import android.widget.Toast;
+          import androidx.core.content.FileProvider;
           import com.getcapacitor.BridgeActivity;
           import java.io.ByteArrayOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
           import java.io.InputStream;
           import java.io.OutputStream;
           import java.util.ArrayList;
@@ -492,6 +774,12 @@ jobs:
             @Override
             public void onActivityResult(int req, int res, Intent data) {
               super.onActivityResult(req, res, data);
+              if (req == REQ_OPEN && (res != RESULT_OK || data == null || data.getData() == null)) {
+                getBridge().getWebView().post(() ->
+                  getBridge().getWebView().evaluateJavascript(
+                    "window.__openCancelled && window.__openCancelled()", null));
+                return;
+              }
               if (res != RESULT_OK || data == null || data.getData() == null) return;
               Uri uri = data.getData();
               if (req == REQ_CREATE && saveBytes != null) {
@@ -525,6 +813,14 @@ jobs:
               getBridge().getWebView().post(() ->
                 getBridge().getWebView().evaluateJavascript(
                   "window.__openPending && window.__openPending()", null));
+            }
+
+            private void openFilePicker() {
+              Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+              i.addCategory(Intent.CATEGORY_OPENABLE);
+              i.setType("*/*");
+              i.addFlags(RW | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+              startActivityForResult(i, REQ_OPEN);
             }
 
             private String hash(byte[] b) {
@@ -626,10 +922,57 @@ jobs:
               saveBytes = data;
               Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
               i.addCategory(Intent.CATEGORY_OPENABLE);
-              i.setType(mime);
+              i.setType(mime != null && !mime.isEmpty() ? mime : "*/*");
               i.putExtra(Intent.EXTRA_TITLE, name);
               i.addFlags(RW | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
               startActivityForResult(i, REQ_CREATE);
+            }
+
+            private void doShareFile(String name, String mime, byte[] data, String text) {
+              try {
+                File outFile = new File(getCacheDir(), name);
+                FileOutputStream fos = new FileOutputStream(outFile);
+                fos.write(data);
+                fos.close();
+                Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".fileprovider", outFile);
+                Intent i = new Intent(Intent.ACTION_SEND);
+                i.setType(mime != null && !mime.isEmpty() ? mime : "*/*");
+                i.putExtra(Intent.EXTRA_STREAM, uri);
+                if (text != null && !text.isEmpty()) {
+                  i.putExtra(Intent.EXTRA_TEXT, text);
+                }
+                i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                startActivity(Intent.createChooser(i, "Share " + name));
+              } catch (Exception e) {
+                toast("Share failed, saving instead: " + e.getMessage());
+                doSave(name, mime, data, false);
+              }
+            }
+
+            private void doShareText(String title, String text) {
+              try {
+                Intent i = new Intent(Intent.ACTION_SEND);
+                i.setType("text/plain");
+                if (title != null && !title.isEmpty()) {
+                  i.putExtra(Intent.EXTRA_SUBJECT, title);
+                }
+                i.putExtra(Intent.EXTRA_TEXT, text != null ? text : "");
+                startActivity(Intent.createChooser(i, title != null && !title.isEmpty() ? title : "Share"));
+              } catch (Exception e) {
+                toast("Share failed: " + e.getMessage());
+              }
+            }
+
+            private void doPrint(String jobName) {
+              try {
+                WebView webView = getBridge().getWebView();
+                PrintManager printManager = (PrintManager) getSystemService(Context.PRINT_SERVICE);
+                String name = (jobName != null && !jobName.isEmpty()) ? jobName : "Document";
+                PrintDocumentAdapter adapter = webView.createPrintDocumentAdapter(name);
+                printManager.print(name, adapter, new PrintAttributes.Builder().build());
+              } catch (Exception e) {
+                toast("Print failed: " + e.getMessage());
+              }
             }
 
             private void remember(String name, Uri uri) {
@@ -683,11 +1026,7 @@ jobs:
                 .setTitle("Files")
                 .setItems(labels.toArray(new String[0]), (d, which) -> {
                   if (which == 0) {
-                    Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                    i.addCategory(Intent.CATEGORY_OPENABLE);
-                    i.setType("*/*");
-                    i.addFlags(RW | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
-                    startActivityForResult(i, REQ_OPEN);
+                    openFilePicker();
                   } else if (which == 1) {
                     forcePicker = true;
                     toast("Press Save in the app to choose a new location");
@@ -778,12 +1117,39 @@ jobs:
               }
 
               @JavascriptInterface
+              public void pickFile() {
+                runOnUiThread(() -> openFilePicker());
+              }
+
+              @JavascriptInterface
               public void save(String name, String mime, String b64, boolean auto) {
                 final byte[] data = Base64.decode(b64, Base64.DEFAULT);
                 final String n = name.replace("/", "_").replace("\\", "_");
                 final String m = mime;
                 final boolean a = auto;
                 runOnUiThread(() -> doSave(n, m, data, a));
+              }
+
+              @JavascriptInterface
+              public void shareFile(String name, String mime, String b64, String text) {
+                final byte[] data = Base64.decode(b64, Base64.DEFAULT);
+                final String n = name.replace("/", "_").replace("\\", "_");
+                final String m = mime;
+                final String t = text;
+                runOnUiThread(() -> doShareFile(n, m, data, t));
+              }
+
+              @JavascriptInterface
+              public void shareText(String title, String text) {
+                final String ti = title;
+                final String te = text;
+                runOnUiThread(() -> doShareText(ti, te));
+              }
+
+              @JavascriptInterface
+              public void printPage(String jobName) {
+                final String j = jobName;
+                runOnUiThread(() -> doPrint(j));
               }
             }
           }
