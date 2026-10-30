@@ -87,16 +87,26 @@ jobs:
           cat > www/android-save.js <<'EOF'
           (function () {
             var blobs = {};
-            var oCreate = URL.createObjectURL.bind(URL);
-            URL.createObjectURL = function (obj) {
-              var u = oCreate(obj);
-              try { if (obj instanceof Blob) blobs[u] = obj; } catch (e) {}
-              return u;
-            };
-            var oRevoke = URL.revokeObjectURL.bind(URL);
-            URL.revokeObjectURL = function (u) {
-              setTimeout(function () { delete blobs[u]; }, 60000);
-              return oRevoke(u);
+            var names = {};
+            var lastDl = null;
+            var saved = 0;
+            var extFor = {
+              'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+              'application/pdf': 'pdf',
+              'text/html': 'html',
+              'text/plain': 'txt',
+              'text/markdown': 'md',
+              'application/rtf': 'rtf',
+              'text/rtf': 'rtf',
+              'application/vnd.oasis.opendocument.text': 'odt',
+              'application/x-tex': 'tex',
+              'text/x-tex': 'tex',
+              'application/xml': 'xml',
+              'text/xml': 'xml',
+              'image/png': 'png',
+              'image/jpeg': 'jpg',
+              'image/svg+xml': 'svg',
+              'application/json': 'json'
             };
             function banner(msg) {
               if (window.__autosaving || !document.body) return;
@@ -104,15 +114,16 @@ jobs:
               if (!d) {
                 d = document.createElement('div');
                 d.id = '__sv';
-                d.style.cssText = 'position:fixed;left:12px;bottom:12px;background:rgba(0,0,0,0.85);color:#fff;font:13px sans-serif;padding:8px 12px;border-radius:8px;z-index:99999';
+                d.style.cssText = 'position:fixed;left:12px;bottom:12px;max-width:70%;background:rgba(0,0,0,0.9);color:#fff;font:13px sans-serif;padding:8px 12px;border-radius:8px;z-index:99999';
                 document.body.appendChild(d);
               }
               d.textContent = msg;
               d.style.display = 'block';
               clearTimeout(d.__t);
-              d.__t = setTimeout(function () { d.style.display = 'none'; }, 3500);
+              d.__t = setTimeout(function () { d.style.display = 'none'; }, 6000);
             }
             function sendBlob(name, blob) {
+              saved = Date.now();
               banner('Saving ' + name + ' ...');
               var rd = new FileReader();
               rd.onloadend = function () {
@@ -123,9 +134,68 @@ jobs:
               };
               rd.readAsDataURL(blob);
             }
+            var oCreate = URL.createObjectURL.bind(URL);
+            URL.createObjectURL = function (obj) {
+              var u = oCreate(obj);
+              try {
+                if (obj instanceof Blob) {
+                  blobs[u] = obj;
+                  var ty = String(obj.type || '');
+                  if (obj.size > 1024 && !/^(image|font|video|audio)\//.test(ty) && !/javascript|wasm/.test(ty)) {
+                    var t0 = Date.now();
+                    setTimeout(function () {
+                      if (saved < t0) {
+                        banner('A file was made (' + (ty || 'unknown type') + ', ' + obj.size + ' bytes) but no download was caught. showSaveFilePicker: ' + typeof window.showSaveFilePicker);
+                      }
+                    }, 2500);
+                  }
+                }
+              } catch (e) {}
+              return u;
+            };
+            var oRevoke = URL.revokeObjectURL.bind(URL);
+            URL.revokeObjectURL = function (u) {
+              setTimeout(function () { delete blobs[u]; }, 60000);
+              return oRevoke(u);
+            };
+            function note(a) {
+              try {
+                var n = a.getAttribute('download');
+                if (n !== null) {
+                  var h = a.href;
+                  if (h) names[h] = n || 'export';
+                  lastDl = { name: n || 'export', t: Date.now() };
+                }
+              } catch (e) {}
+            }
+            try {
+              var A = HTMLAnchorElement.prototype;
+              var dd = Object.getOwnPropertyDescriptor(A, 'download');
+              Object.defineProperty(A, 'download', {
+                configurable: true,
+                enumerable: dd.enumerable,
+                get: dd.get,
+                set: function (v) { dd.set.call(this, v); note(this); }
+              });
+              var hd = Object.getOwnPropertyDescriptor(A, 'href');
+              Object.defineProperty(A, 'href', {
+                configurable: true,
+                enumerable: hd.enumerable,
+                get: hd.get,
+                set: function (v) { hd.set.call(this, v); note(this); }
+              });
+            } catch (e) {}
+            var oSet = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function (k, v) {
+              var r = oSet.apply(this, arguments);
+              try {
+                if (this instanceof HTMLAnchorElement && (k === 'download' || k === 'href')) note(this);
+              } catch (e) {}
+              return r;
+            };
             function save(a) {
-              var name = a.getAttribute('download') || 'export';
               var href = a.href;
+              var name = a.getAttribute('download') || names[href] || 'export';
               var b = blobs[href];
               if (b) {
                 sendBlob(name, b);
@@ -136,6 +206,26 @@ jobs:
                 .then(function (bl) { sendBlob(name, bl); })
                 .catch(function (e) { banner('Save failed: ' + e); });
             }
+            window.__nativeDownload = function (url, cd, mime) {
+              var name = names[url];
+              if (!name && cd) {
+                var m = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(cd);
+                if (m) {
+                  try { name = decodeURIComponent(m[1]); } catch (e) { name = m[1]; }
+                }
+              }
+              if (!name && lastDl && Date.now() - lastDl.t < 5000) name = lastDl.name;
+              if (!name) name = 'document.' + (extFor[mime] || 'bin');
+              var b = blobs[url];
+              if (b) {
+                sendBlob(name, b);
+                return;
+              }
+              fetch(url)
+                .then(function (r) { return r.blob(); })
+                .then(function (bl) { sendBlob(name, bl); })
+                .catch(function (e) { banner('Save failed: ' + e); });
+            };
             var origClick = HTMLAnchorElement.prototype.click;
             HTMLAnchorElement.prototype.click = function () {
               if (window.AndroidSaver && this.hasAttribute('download')) {
@@ -164,8 +254,7 @@ jobs:
             window.open = function (u) {
               if (window.AndroidSaver && typeof u === 'string' && u.indexOf('blob:') === 0 && blobs[u]) {
                 var b = blobs[u];
-                var map = { 'application/pdf': 'pdf', 'text/html': 'html', 'text/plain': 'txt', 'image/png': 'png' };
-                sendBlob('document.' + (map[b.type] || 'bin'), b);
+                sendBlob('document.' + (extFor[b.type] || 'bin'), b);
                 return null;
               }
               return oOpen.apply(window, arguments);
@@ -377,6 +466,13 @@ jobs:
               prefs = getSharedPreferences("files", MODE_PRIVATE);
               autoSave = prefs.getBoolean("autosave", true);
               getBridge().getWebView().addJavascriptInterface(new Saver(), "AndroidSaver");
+              getBridge().getWebView().setDownloadListener((url, ua, cd, mime, len) -> {
+                final String js = "window.__nativeDownload && window.__nativeDownload("
+                  + JSONObject.quote(url) + ","
+                  + JSONObject.quote(cd == null ? "" : cd) + ","
+                  + JSONObject.quote(mime == null ? "" : mime) + ")";
+                runOnUiThread(() -> getBridge().getWebView().evaluateJavascript(js, null));
+              });
               addFilesButton();
               Intent in = getIntent();
               if (in != null && Intent.ACTION_VIEW.equals(in.getAction()) && in.getData() != null) {
